@@ -190,6 +190,20 @@ namespace eval ::plugins::GrindAdvisor {
         set L(sec_fill) "#FFFFFF"
         set L(sec_outline) "#dcdcdc"
 
+        # v2.1.0 calibration-accuracy gauge: 10-segment bar, one accent for
+        # filled segments and one neutral for empty (no rainbow), plus the
+        # band thresholds (upper bound of each band).
+        set L(conf_segments) 10
+        set L(conf_seg_w) [expr {int(round(15 * $scale))}]
+        set L(conf_seg_gap) [expr {int(round(3 * $scale))}]
+        set L(conf_seg_h) [expr {int(round(20 * $scale))}]
+        set L(conf_seg_r) [expr {int(round(4 * $scale))}]
+        set L(conf_fill) "#4e85f4"
+        set L(conf_empty) "#e3e6ee"
+        set L(conf_poor_max) 39
+        set L(conf_fair_max) 64
+        set L(conf_good_max) 84
+
         set L(btn_w_std) [expr {int(round(200 * $scale))}]
         set L(btn_w_wide) [expr {int(round(240 * $scale))}]
         set L(btn_h) [expr {int(max(60, round(60 * $scale)))}]
@@ -786,6 +800,77 @@ namespace eval ::plugins::GrindAdvisor {
         return $out
     }
 
+    # ------------------------------------------------------------------
+    #  Calibration Accuracy (v2.1.0) -- DISPLAY ONLY. Never feeds back
+    #  into any recommendation; computed purely from rows already read.
+    #
+    #  Relevant shots = valid shots sharing the current shot's bag (or
+    #  matching its recipe when no bag fields exist -- the same fallback
+    #  order the calibration search uses), so a new bag resets the score
+    #  exactly like it resets calibration.
+    #    evidence    = min(relevant_count, 5) / 5
+    #    consistency = 1 - avg(|shot_time - target|)/10s  (floored at 0,
+    #                  over the most recent up-to-4 relevant shots)
+    #    score       = round(100 * (0.4*evidence + 0.6*consistency))
+    #  Fewer than 2 relevant shots -> not scored ("Not enough data").
+    # ------------------------------------------------------------------
+    proc _confidence_band {score} {
+        variable L
+        set poor 39; set fair 64; set good 84
+        catch { set poor $L(conf_poor_max); set fair $L(conf_fair_max); set good $L(conf_good_max) }
+        if {$score <= $poor} { return "Poor" }
+        if {$score <= $fair} { return "Fair" }
+        if {$score <= $good} { return "Good" }
+        return "Excellent"
+    }
+
+    proc _calibration_confidence {rows} {
+        set nrows [llength $rows]
+        if {$nrows == 0} { return [dict create ok 0] }
+        set current [_shot_from_row [lindex $rows 0]]
+        if {[dict size $current] == 0} { return [dict create ok 0] }
+        set target [_to_float [_setting target_time 28.0]]
+        if {$target eq "" || $target <= 0} { set target 28.0 }
+
+        set count 0
+        set recent_errs {}
+        for {set pos 0} {$pos < $nrows} {incr pos} {
+            set shot [_shot_from_row [lindex $rows $pos]]
+            if {[dict size $shot] == 0} { continue }
+            if {[dict exists $current bag_key]} {
+                if {![_same_bag $current $shot]} { continue }
+            } elseif {![_recipe_matches $current $shot]} {
+                continue
+            }
+            incr count
+            if {[llength $recent_errs] < 4} {
+                lappend recent_errs [expr {abs([dict get $shot duration] - $target)}]
+            }
+        }
+        if {$count < 2} { return [dict create ok 0] }
+
+        set evidence [expr {double(min($count, 5)) / 5.0}]
+        set sum 0.0
+        foreach e $recent_errs { set sum [expr {$sum + $e}] }
+        set avg_err [expr {$sum / double([llength $recent_errs])}]
+        set consistency [expr {1.0 - $avg_err / 10.0}]
+        if {$consistency < 0.0} { set consistency 0.0 }
+        set score [expr {int(round(100.0 * (0.4 * $evidence + 0.6 * $consistency)))}]
+        if {$score > 100} { set score 100 }
+        if {$score < 0} { set score 0 }
+        return [dict create ok 1 score $score band [_confidence_band $score]]
+    }
+
+    # Fresh score for the settings page (read-only SELECT, same pipeline
+    # every other consumer uses).
+    proc calibration_confidence {} {
+        lassign [locate_shot_source] db table fields
+        if {$db eq "" || $table eq ""} { return [dict create ok 0] }
+        set rows [_fetch_recent $db $table $fields 40]
+        set rows [_filter_valid_rows $rows $fields]
+        return [_calibration_confidence $rows]
+    }
+
     proc analyze_latest_shot {} {
         lassign [locate_shot_source] db table fields
         if {$db eq "" || $table eq ""} {
@@ -824,6 +909,14 @@ namespace eval ::plugins::GrindAdvisor {
         set previous [_find_calibration_shot $current $rows 1]
         set rec [compute_recommendation $current $previous]
         dict set rec ok 1
+
+        # Display-only calibration confidence (v2.1.0); attached after the
+        # recommendation is fully computed so it can never influence it.
+        set conf [_calibration_confidence $rows]
+        if {[dict get $conf ok]} {
+            dict set rec confidence [dict get $conf score]
+            dict set rec confidence_band [dict get $conf band]
+        }
 
         dict set rec timestamp [_dget $cur timestamp]
 
@@ -1688,6 +1781,13 @@ namespace eval ::plugins::GrindAdvisor {
                 set rlines [_text_lines $reason $fbody $inner]
                 if {$rlines > 4} { set rlines 4 }
 
+                # Display-only calibration confidence (v2.1.0), one caption
+                # line under the Reason block.
+                set conf_line ""
+                if {[dict exists $rec confidence]} {
+                    set conf_line "Calibration: [dict get $rec confidence]% [format %c 0x2014] [dict get $rec confidence_band]"
+                }
+
                 # Content-driven card height.
                 set ch [expr {$pad + $fsec + $gap_lg + $fhero + $gap_sm + $fbody \
                     + $gap_xl + $nrows * $row_pitch}]
@@ -1695,6 +1795,7 @@ namespace eval ::plugins::GrindAdvisor {
                 if {$reason ne ""} {
                     set ch [expr {$ch + $gap_xl + $fcap + $gap_sm + $rlines * $reason_lineh}]
                 }
+                if {$conf_line ne ""} { set ch [expr {$ch + $gap_sm + $fcap}] }
                 set ch [expr {$ch + $gap_xl + $btnh + $pad}]
                 if {$ch > ($H - 40)} { set ch [expr {$H - 40}] }
 
@@ -1737,6 +1838,11 @@ namespace eval ::plugins::GrindAdvisor {
                     _otext $o $lab_x [expr {$y + $fcap / 2}] w "Reason" $fcap [dict get $col muted] $inner left
                     incr y [expr {$fcap + $gap_sm}]
                     _otext $o $lab_x $y nw $reason $fbody [dict get $col text] $inner left
+                    incr y [expr {$rlines * $reason_lineh}]
+                }
+                if {$conf_line ne ""} {
+                    incr y $gap_sm
+                    _otext $o $lab_x [expr {$y + $fcap / 2}] w [_fit_text $conf_line $fcap $inner] $fcap [dict get $col muted] $inner left
                 }
 
                 # Button row: OK / Why? / History, identical size, evenly spaced.
@@ -2411,6 +2517,7 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
         set shot_h [expr {2 * $L(sec_pad) + $L(sec_title_h) + $L(md) + 3 * $L(entry_row_pitch) - $L(md)}]
         set act_h  [expr {2 * $L(sec_pad) + $L(sec_title_h) + $L(md) + 2 * $L(btn_h) + $L(md)}]
         set two_h  [expr {2 * $L(sec_pad) + $L(sec_title_h) + $L(md) + 2 * $L(row_pitch) - $L(md)}]
+        set three_h [expr {2 * $L(sec_pad) + $L(sec_title_h) + $L(md) + 3 * $L(row_pitch) - $L(md)}]
 
         # --- LEFT column: Shot Settings first so its numeric entries sit in
         # --- the top half of the screen (Android keyboard), then Actions.
@@ -2449,18 +2556,19 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
             -command ::plugins::GrindAdvisor::_show_history_dialog \
             -label_font $L(font_button) -style ga_btn
 
-        # --- RIGHT column: Recommendation, then Popup. Rows use the
+        # --- RIGHT column: Recommendation (3 rows: two controls + the
+        # --- calibration-accuracy gauge), then Popup. Rows use the
         # --- card-relative grid: label / value / right-aligned button.
-        foreach {card_tag card_title card_y rows} [list \
-            sec_reco "Recommendation" $L(sec_top) {
+        foreach {card_tag card_title card_y card_h rows} [list \
+            sec_reco "Recommendation" $L(sec_top) $three_h {
                 rounding "Grind rounding increment" rounding_value "Next" cycle_rounding
                 mode "Recommendation mode" mode_value "Next" cycle_mode
             } \
-            sec_popup "Popup" [expr {$L(sec_top) + $two_h + $L(sec_gap)}] {
+            sec_popup "Popup" [expr {$L(sec_top) + $three_h + $L(sec_gap)}] $two_h {
                 theme "Popup theme" popup_theme_value "Toggle" toggle_popup_theme
                 popup "Automatic popup" enable_popup_value "Toggle" toggle_enable_popup
             }] {
-            set rows_y [::plugins::GrindAdvisor::_sec_card $page $card_tag $c2x $card_y $col_w $two_h $card_title]
+            set rows_y [::plugins::GrindAdvisor::_sec_card $page $card_tag $c2x $card_y $col_w $card_h $card_title]
             set lab_x [expr {$c2x + $L(sec_pad)}]
             set val_x [expr {$c2x + $L(sec_value_dx)}]
             set btn_x2 [expr {$c2x + $col_w - $L(sec_pad)}]
@@ -2481,6 +2589,28 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
                 incr row
             }
         }
+
+        # Calibration Accuracy gauge: third row of the Recommendation card.
+        # 10 rounded segments at the value column; score text (caption size,
+        # so "100% -- Excellent" always fits) to their right; no button.
+        set reco_rows_y [expr {$L(sec_top) + $L(sec_pad) + $L(sec_title_h) + $L(md)}]
+        set gy [expr {$reco_rows_y + 2 * $L(row_pitch)}]
+        set gmid [expr {$gy + $L(btn_h) / 2}]
+        set glab_x [expr {$c2x + $L(sec_pad)}]
+        set gval_x [expr {$c2x + $L(sec_value_dx)}]
+        dui add dtext $page $glab_x $gmid -tags conf_label -text [translate "Calibration Accuracy"] \
+            -font $L(font_body) -width $L(sec_label_w) -fill "#444444" -anchor w -justify left
+        set seg_y0 [expr {$gy + ($L(btn_h) - $L(conf_seg_h)) / 2}]
+        set seg_y1 [expr {$seg_y0 + $L(conf_seg_h)}]
+        for {set i 0} {$i < $L(conf_segments)} {incr i} {
+            set sx0 [expr {$gval_x + $i * ($L(conf_seg_w) + $L(conf_seg_gap))}]
+            ::plugins::GrindAdvisor::rounded_rect $page $sx0 $seg_y0 [expr {$sx0 + $L(conf_seg_w)}] $seg_y1 \
+                $L(conf_seg_r) -fill $L(conf_empty) -outline $L(conf_empty) -width 1 -tags conf_seg$i
+        }
+        set conf_text_x [expr {$gval_x + $L(conf_segments) * ($L(conf_seg_w) + $L(conf_seg_gap)) - $L(conf_seg_gap) + $L(lg)}]
+        dui add dtext $page $conf_text_x $gmid -tags conf_text -text "" \
+            -font $L(font_caption) -width [expr {$c2x + $col_w - $L(sec_pad) - $conf_text_x}] \
+            -fill "#444444" -anchor w -justify left
 
         # Bottom bar unchanged, outside any card: Done left, Advanced right.
         dui add dbutton $page $lx $L(bar_y0) [expr {$lx + $L(btn_w_std)}] $L(bar_y1) \
@@ -2514,6 +2644,27 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
         catch { dui item config $page mode_value -text $data(mode_value) }
         catch { dui item config $page rounding_value -text $data(rounding_value) }
         catch { dui item config $page enable_popup_value -text $data(enable_popup_value) }
+        refresh_confidence $page
+    }
+
+    # Calibration Accuracy gauge (v2.1.0, display-only; read-only fetch).
+    proc refresh_confidence {page} {
+        upvar #0 ::plugins::GrindAdvisor::L L
+        set emdash [format %c 0x2014]
+        set conf [::plugins::GrindAdvisor::calibration_confidence]
+        if {[dict exists $conf ok] && [dict get $conf ok]} {
+            set score [dict get $conf score]
+            set filled [expr {int(round($score / 10.0))}]
+            set txt "$score% $emdash [dict get $conf band]"
+        } else {
+            set filled 0
+            set txt [translate "Not enough data"]
+        }
+        for {set i 0} {$i < $L(conf_segments)} {incr i} {
+            set color [expr {$i < $filled ? $L(conf_fill) : $L(conf_empty)}]
+            catch { dui item config $page conf_seg$i -fill $color -outline $color }
+        }
+        catch { dui item config $page conf_text -text $txt }
     }
 
     proc toggle_enable_popup {} {
@@ -2740,7 +2891,9 @@ namespace eval ::dui::pages::GrindAdvisor_help {
             "Conservative: Small, safe changes. Best if you are near the right grind and want to avoid big jumps." \
             "Normal: Moderate changes. Balanced mode." \
             "Dynamic Barista: Recommended default. Uses shot error and same-bag calibration when available. Can make larger changes when the shot is clearly too fast or slow." \
-            "Aggressive New Bean: Bigger corrections for dialing in a new bean quickly. Useful when the first shots are very fast or very slow."] "\n"]
+            "Aggressive New Bean: Bigger corrections for dialing in a new bean quickly. Useful when the first shots are very fast or very slow." \
+            "" \
+            "Calibration Accuracy is a display-only confidence score from 0 to 100. It combines evidence (how many valid shots of the same bag or recipe feed the calibration; full credit at 5) with consistency (how close those recent shots landed to your target time; a 0s average error scores full, 10s or more scores zero), weighted 40/60. Fewer than 2 relevant shots shows Not enough data, and a new bag resets the score exactly like it resets calibration. More consistent shots on the same beans raise it; erratic times or a bean change lower it. It never changes the recommendation itself."] "\n"]
 
         set card_h [expr {$L(bar_y0) - $L(md) - $L(sec_top)}]
         set rows_y [::plugins::GrindAdvisor::_sec_card $page sec_help $lx $L(sec_top) $L(content_w) $card_h "Guide"]

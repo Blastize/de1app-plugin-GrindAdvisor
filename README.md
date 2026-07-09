@@ -1,6 +1,6 @@
-# Grind Advisor v2.0.2
+# Grind Advisor v2.1.0
 
-Current plugin version: **v2.0.2**.
+Current plugin version: **v2.1.0**.
 
 A DE1app (Decent Espresso) plugin. After every completed espresso shot it
 reads your latest shot from **SDB** and shows a popup recommending your next
@@ -21,6 +21,7 @@ grind setting. You enter nothing by hand.
 │   Reason                          │
 │   Fast shot, using default        │
 │   estimate.                       │
+│   Calibration: 82% — Good         │
 │                                   │
 │  [ OK ]   [ Why? ]   [ History ]  │
 └───────────────────────────────────┘
@@ -28,6 +29,19 @@ grind setting. You enter nothing by hand.
 
 Dose and Yield lines appear automatically when those columns exist in SDB; if
 they aren't stored, those lines are simply omitted.
+
+## Calibration Accuracy
+
+A display-only confidence score (0–100) for the current recommendation,
+shown as a 10-segment gauge on the settings page and as the "Calibration"
+line in the popup. It combines **evidence** (how many valid shots of the
+same bag or recipe feed the calibration; full credit at 5) and
+**consistency** (how close those recent shots landed to your target time;
+0 s average error scores full, 10 s or more scores zero), weighted 40/60.
+Bands: 0–39 Poor, 40–64 Fair, 65–84 Good, 85–100 Excellent. Fewer than 2
+relevant shots shows "Not enough data", and a new bag resets the score —
+exactly like it resets calibration. It never changes the recommendation
+itself.
 
 ## Install
 

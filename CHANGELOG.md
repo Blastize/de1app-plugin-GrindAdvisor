@@ -2,6 +2,16 @@
 
 All database and history-file access is strictly read-only in every version.
 
+## v2.1.0 — 2026-07-10
+
+- New: Calibration Accuracy — a display-only confidence gauge (0–100) for
+  the current recommendation, shown on the settings page (10-segment bar)
+  and as a line in the after-shot popup, explained on the Help page. It
+  weighs how many valid same-bag/recipe shots feed the calibration against
+  how consistently recent shots hit your target time. Fewer than 2 relevant
+  shots shows "Not enough data"; a new bag resets it. Recommendation math
+  is unchanged — the score never feeds back.
+
 ## v2.0.2 — 2026-07-07
 
 - Fixed the history page's Prev/Next buttons showing escape text instead of
