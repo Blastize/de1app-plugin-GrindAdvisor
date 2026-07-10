@@ -39,6 +39,8 @@ namespace eval ::plugins::GrindAdvisor {
         timestamp    {{(^|_)clock(_|$)} {timestamp} {datetime} {(^|_)date(_|$)} {epoch}}
         profile      {{^profile_title$} {profile_?title} {profile_?name} {(^|_)profile(_|$)}}
         bev_type     {{^beverage_type$} {^final_beverage_type$} {beverage_?type} {beverage} {drink_?type}}
+        filename     {{^filename$}}
+        removed      {{^removed$}}
     }
 
     variable bag_field_patterns
@@ -768,12 +770,65 @@ namespace eval ::plugins::GrindAdvisor {
         return [regexp -nocase -- $_reject_re $t]
     }
 
+    # ------------------------------------------------------------------
+    #  Deleted-shot tolerance (v2.1.1)
+    #
+    #  Deleting a shot (e.g. ShotHistoryEditor's soft delete) removes the
+    #  history file but never touches SDB; SDB's own resync then flags the
+    #  row removed=1 rather than deleting it. Two defensive layers keep
+    #  such shots out of everything (popup, history, calibration,
+    #  confidence): the removed flag is filtered in the SQL WHERE (see
+    #  _fetch_recent), and -- for the window before any resync has run --
+    #  rows whose file no longer exists in history/ or history_archive/
+    #  are rejected below. If the schema has no filename column or the
+    #  history folders can't be located (e.g. desktop testing), nothing
+    #  is filtered.
+    # ------------------------------------------------------------------
+    variable _hist_probed 0
+    variable _hist_dirs {}
+
+    proc _history_dirs {} {
+        variable _hist_probed
+        variable _hist_dirs
+        if {!$_hist_probed} {
+            set _hist_probed 1
+            set dirs {}
+            catch {
+                foreach sub {history history_archive} {
+                    set d [file join [homedir] $sub]
+                    if {[file isdirectory $d]} { lappend dirs $d }
+                }
+            }
+            set _hist_dirs $dirs
+        }
+        return $_hist_dirs
+    }
+
+    proc _shot_file_exists {fn} {
+        set dirs [_history_dirs]
+        if {[llength $dirs] == 0} { return 1 }
+        if {![string match -nocase "*.shot" $fn]} { append fn ".shot" }
+        foreach d $dirs {
+            if {[file exists [file join $d $fn]]} { return 1 }
+        }
+        return 0
+    }
+
     proc _row_is_valid_espresso {row fields} {
         # Reject by profile title / beverage type keywords when available.
         foreach key {profile bev_type} {
             if {[dict exists $fields $key] && [_text_is_nonespresso [_dget $row $key]]} {
                 return 0
             }
+        }
+        # Reject deleted shots (see deleted-shot tolerance note above).
+        if {[dict exists $fields removed]} {
+            set rm [string trim [_dget $row removed]]
+            if {[string is true -strict $rm]} { return 0 }
+        }
+        if {[dict exists $fields filename]} {
+            set fn [string trim [_dget $row filename]]
+            if {$fn ne "" && ![_shot_file_exists $fn]} { return 0 }
         }
         # Reject shots under 5 seconds (rinses, aborts, dummies).
         set dur [_duration_seconds [_dget $row duration]]
@@ -1385,7 +1440,7 @@ namespace eval ::plugins::GrindAdvisor {
         variable field_patterns
         set assigned {}
         set result {}
-        foreach field {grind dose set_yield actual_yield timestamp duration profile bev_type} {
+        foreach field {grind dose set_yield actual_yield timestamp duration profile bev_type filename removed} {
             foreach pat $field_patterns($field) {
                 foreach c $cols {
                     if {[dict exists $assigned $c]} { continue }
@@ -1426,7 +1481,7 @@ namespace eval ::plugins::GrindAdvisor {
         set sel {}
         set order {}
         set selected {}
-        foreach field {grind duration dose set_yield actual_yield timestamp profile bev_type} {
+        foreach field {grind duration dose set_yield actual_yield timestamp profile bev_type filename removed} {
             if {[dict exists $fields $field]} {
                 set col [dict get $fields $field]
                 if {![dict exists $selected $col]} {
@@ -1458,6 +1513,14 @@ namespace eval ::plugins::GrindAdvisor {
             set q "SELECT [join $sel {, }] FROM [_q $table]"
         }
         append q " WHERE $gcol IS NOT NULL AND $dcol IS NOT NULL"
+        # v2.1.1: honor SDB's own deleted-shot flag. SDB's resync marks rows
+        # whose history file vanished with removed=1 (it never deletes rows),
+        # so filtering here keeps deleted shots out without touching SDB.
+        # Read-only SELECT filter; only applies when the column exists.
+        if {[dict exists $fields removed]} {
+            set rmcol [_q [dict get $fields removed]]
+            append q " AND ($rmcol IS NULL OR $rmcol = 0)"
+        }
         if {[dict exists $fields timestamp]} {
             append q " ORDER BY [_q [dict get $fields timestamp]] DESC"
         } else {
@@ -2449,7 +2512,10 @@ namespace eval ::plugins::GrindAdvisor {
             "Detected set yield column: [_field_debug_value $fields set_yield]" \
             "Detected actual yield column: [_field_debug_value $fields actual_yield]" \
             "Detected shot time column: [_field_debug_value $fields duration]" \
-            "Detected bag fields: [_field_debug_value $fields bag_fields]"]
+            "Detected bag fields: [_field_debug_value $fields bag_fields]" \
+            "Detected filename column: [_field_debug_value $fields filename]" \
+            "Detected removed-flag column: [_field_debug_value $fields removed]" \
+            "Deleted-shot file check: [expr {[llength [_history_dirs]] > 0 ? "active (history folder found)" : "off (history folder not found)"}]"]
         return [join $lines "\n"]
     }
 

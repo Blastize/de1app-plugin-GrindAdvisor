@@ -1,6 +1,6 @@
-# Grind Advisor v2.1.0
+# Grind Advisor v2.1.1
 
-Current plugin version: **v2.1.0**.
+Current plugin version: **v2.1.1**.
 
 A DE1app (Decent Espresso) plugin. After every completed espresso shot it
 reads your latest shot from **SDB** and shows a popup recommending your next
