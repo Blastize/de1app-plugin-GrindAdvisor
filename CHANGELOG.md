@@ -2,6 +2,16 @@
 
 All database and history-file access is strictly read-only in every version.
 
+## v2.1.1 — 2026-07-10
+
+- Fixed: shots deleted from the history folder (e.g. by a shot-editor
+  plugin's soft delete) kept appearing in Grind Advisor's history,
+  calibration, and confidence score. Grind Advisor now honors the shot
+  database's `removed` flag and also skips rows whose history file no
+  longer exists, so deleted shots disappear immediately — no resync
+  needed. Both checks auto-disable on databases that don't have the
+  relevant columns; the Diagnostics page shows their status.
+
 ## v2.1.0 — 2026-07-10
 
 - New: Calibration Accuracy — a display-only confidence gauge (0–100) for
