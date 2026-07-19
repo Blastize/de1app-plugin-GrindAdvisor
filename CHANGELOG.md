@@ -2,6 +2,30 @@
 
 All database and history-file access is strictly read-only in every version.
 
+## v3.0.0 — 2026-07-10
+
+- New recommendation engine: a single built-in **Regression Forecast**
+  method replaces the old Conservative / Normal / Dynamic Barista /
+  Aggressive New Bean modes (there is no mode setting anymore). It uses
+  every shot of the current bag: one shot nudges the grind, two shots
+  measure your bean's seconds-per-grind, and three or more fit a
+  recency-weighted line through your shots and solve it for the grind that
+  hits your target time. It normalizes out dose/yield weighing error when
+  your shots carry scale data, excludes obvious outliers, and learns your
+  grinder's direction from the data — so it converges on the right grind as
+  shots accumulate. The Why? button and Calculation Details page show the
+  learned slope, model fit (R²), shot count, and every intermediate.
+- Upgrading from 2.x discards the old mode / seconds-per-step / cap settings
+  gracefully. Recommendation math verified against the reference spreadsheet.
+
+## v2.3.0 — 2026-07-10
+
+- New: **Dose / Yield Source** (Advanced) — choose whether recommendations
+  report your set dose/yield, the measured (actual) values, or Auto
+  (measured when plausible, else set — the default). The popup, reason line,
+  and Diagnostics always state which source was used. Display-only; it does
+  not change the recommended grind.
+
 ## v2.2.0 — 2026-07-10
 
 - New: the Calculation Details page (under Advanced) now shows a trace of

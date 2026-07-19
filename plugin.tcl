@@ -19,7 +19,7 @@ set plugin_name "GrindAdvisor"
 namespace eval ::plugins::GrindAdvisor {
     variable author      "Blastize"
     variable contact     "n/a"
-    variable version     "2.2.0"
+    variable version     "3.0.0"
     variable name        "Grind Advisor"
     variable description  "Reads your latest shot from SDB and recommends your next grind. Read-only, no manual entry."
 
@@ -31,14 +31,10 @@ namespace eval ::plugins::GrindAdvisor {
     variable settings
     foreach {__k __v} {
         target_time              28.0
-        default_seconds_per_step 5.0
-        first_cap                1.0
-        later_cap                0.75
         popup_delay_ms           1500
         popup_theme              dark
         popup_font_scale         1.0
         enable_popup             1
-        recommendation_mode      dynamic_barista
         grinder_min              0
         grinder_max              50
         grind_rounding_increment 0.5
@@ -52,6 +48,11 @@ namespace eval ::plugins::GrindAdvisor {
         history_show_shot_time   1
         history_show_reason      1
         history_show_bag_shot    1
+        dose_yield_mode          auto
+        dose_min                 12.0
+        dose_max                 22.0
+        ratio_min                1.0
+        ratio_max                4.0
     } {
         if {![info exists settings($__k)]} { set settings($__k) $__v }
     }
