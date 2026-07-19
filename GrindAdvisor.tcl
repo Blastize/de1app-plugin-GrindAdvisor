@@ -2515,7 +2515,65 @@ namespace eval ::plugins::GrindAdvisor {
             "Detected bag fields: [_field_debug_value $fields bag_fields]" \
             "Detected filename column: [_field_debug_value $fields filename]" \
             "Detected removed-flag column: [_field_debug_value $fields removed]" \
-            "Deleted-shot file check: [expr {[llength [_history_dirs]] > 0 ? "active (history folder found)" : "off (history folder not found)"}]"]
+            "Deleted-shot file check: [expr {[llength [_history_dirs]] > 0 ? "active (history folder found)" : "off (history folder not found)"}]" \
+            "" \
+            "Per-shot input/intermediate trace: see Calculation Details."]
+        return [join $lines "\n"]
+    }
+
+    # ------------------------------------------------------------------
+    #  Shot trace (v2.2.0) -- READ-ONLY diagnostics. Recomputes each recent
+    #  shot's recommendation through the exact same procs the popup and
+    #  history use (no math duplicated, no math changed) and dumps every
+    #  input and intermediate: time/target/error, dose, yield, bag shot,
+    #  seconds-per-step + calibration source, cap, raw next, final rec,
+    #  and reason. Two lines per shot, newest first.
+    # ------------------------------------------------------------------
+    proc _shot_trace_text {{limit 5}} {
+        lassign [locate_shot_source] db table fields
+        if {$db eq "" || $table eq ""} {
+            return "Recent shot trace: no SDB source detected."
+        }
+        set rows [_fetch_recent $db $table $fields [expr {$limit + 35}]]
+        set rows [_filter_valid_rows $rows $fields]
+        if {[llength $rows] == 0} {
+            return "Recent shot trace: no valid espresso shots."
+        }
+        set lines [list "Recent shot trace (newest first; same procs the popup uses):"]
+        set nrows [llength $rows]
+        set idx 1
+        for {set pos 0} {$pos < $nrows && $idx <= $limit} {incr pos} {
+            set r [lindex $rows $pos]
+            set current [_shot_from_row $r]
+            if {[dict size $current] == 0} { continue }
+            set bag_shot [_bag_shot_count $current $rows $pos]
+            if {$bag_shot ne ""} { dict set current bag_shot $bag_shot }
+            set previous [_find_calibration_shot $current $rows [expr {$pos + 1}]]
+            set rec [compute_recommendation $current $previous]
+
+            set dt [_format_clock [_dget $r timestamp]]
+            if {$dt eq ""} { set dt "(no timestamp)" }
+            set dose [_to_float [_dget $r dose]]
+            set dose_t [expr {$dose ne "" ? "[_fmt_num $dose]g" : "-"}]
+            set yld [_to_float [_dget $r set_yield]]
+            set yld_t [expr {$yld ne "" ? "[_fmt_num $yld]g" : "-"}]
+            set bag_t [expr {$bag_shot ne "" ? "#$bag_shot" : "-"}]
+            switch -- [_dget $rec source] {
+                same_bag      { set src "same bag" }
+                recent_recipe { set src "recipe" }
+                default       { set src "default est" }
+            }
+            if {[dict get $rec cap_applied]} { set cap_t "cap [_fmt_num [dict get $rec cap]] HIT" } else { set cap_t "cap [_fmt_num [dict get $rec cap]]" }
+
+            lappend lines [format "%d) %s | grind %s time %ss target %ss err %+.1f | dose %s yield %s bag %s" \
+                $idx $dt [_fmt_num [dict get $rec grind]] [_fmt_num [dict get $rec actual]] \
+                [_fmt_num [dict get $rec target]] [dict get $rec error] $dose_t $yld_t $bag_t]
+            lappend lines [format "   spp %s (%s) | %s | raw %s -> rec %s | %s" \
+                [_fmt_num [dict get $rec spp]] $src $cap_t \
+                [_fmt_num [dict get $rec raw_next]] [_fmt_num [dict get $rec next]] \
+                [dict get $rec reason]]
+            incr idx
+        }
         return [join $lines "\n"]
     }
 
@@ -3039,8 +3097,10 @@ namespace eval ::dui::pages::GrindAdvisor_calculation_details {
 
         set card_h [expr {$L(bar_y0) - $L(md) - $L(sec_top)}]
         set rows_y [::plugins::GrindAdvisor::_sec_card $page sec_calcd $lx $L(sec_top) $L(content_w) $card_h "Latest Calculation"]
+        # v2.2.0: caption font so the per-shot trace fits below the summary
+        # block without overflowing the card.
         dui add dtext $page [expr {$lx + $L(sec_pad)}] $rows_y -tags calculation_text -text "" \
-            -font $L(font_body) -width [expr {$L(content_w) - 2 * $L(sec_pad)}] -fill "#444444" -anchor nw -justify left
+            -font $L(font_caption) -width [expr {$L(content_w) - 2 * $L(sec_pad)}] -fill "#444444" -anchor nw -justify left
 
         dui add dbutton $page $lx $L(bar_y0) [expr {$lx + $L(btn_w_std)}] $L(bar_y1) \
             -tags page_done -label [translate "Done"] \
@@ -3050,7 +3110,7 @@ namespace eval ::dui::pages::GrindAdvisor_calculation_details {
 
     proc show { page_to_hide page_to_show } {
         variable data
-        set data(calculation_text) [::plugins::GrindAdvisor::_calculation_diagnostics_text]
+        set data(calculation_text) "[::plugins::GrindAdvisor::_calculation_diagnostics_text]\n\n[::plugins::GrindAdvisor::_shot_trace_text 5]"
         catch { dui item config $page_to_show calculation_text -text $data(calculation_text) }
     }
 
