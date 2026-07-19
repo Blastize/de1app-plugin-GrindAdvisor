@@ -36,6 +36,7 @@ namespace eval ::plugins::GrindAdvisor {
         dose         {{^grinder_dose_weight$} {grinder_?dose} {dose_?weight} {(^|_)dose(_|$)} {bean_?weight} {(^|_)in_?weight}}
         set_yield    {{^target_drink_weight$} {target_?drink_?weight} {target_?yield} {set_?yield} {desired_?shot_?weight} {final_?desired_?shot_?weight}}
         actual_yield {{^drink_weight$} {actual_?yield} {actual_?drink_?weight} {measured_?yield} {scale_?weight} {drink_?weight} {beverage_?weight} {weight_?out} {(^|_)yield} {(^|_)out_?weight}}
+        actual_dose  {{^bean_weight$} {actual_?dose} {measured_?dose} {dose_?in} {scale_?dose} {dry_?weight} {ground_?weight}}
         timestamp    {{(^|_)clock(_|$)} {timestamp} {datetime} {(^|_)date(_|$)} {epoch}}
         profile      {{^profile_title$} {profile_?title} {profile_?name} {(^|_)profile(_|$)}}
         bev_type     {{^beverage_type$} {^final_beverage_type$} {beverage_?type} {beverage} {drink_?type}}
@@ -70,14 +71,10 @@ namespace eval ::plugins::GrindAdvisor {
         variable settings
         foreach {k v} {
             target_time              28.0
-            default_seconds_per_step 5.0
-            first_cap                1.0
-            later_cap                0.75
             popup_delay_ms           1500
             popup_theme              dark
             popup_font_scale         1.0
             enable_popup             1
-            recommendation_mode      dynamic_barista
             grinder_min              0
             grinder_max              50
             grind_rounding_increment 0.5
@@ -91,6 +88,11 @@ namespace eval ::plugins::GrindAdvisor {
             history_show_shot_time   1
             history_show_reason      1
             history_show_bag_shot    1
+            dose_yield_mode          auto
+            dose_min                 12.0
+            dose_max                 22.0
+            ratio_min                1.0
+            ratio_max                4.0
         } {
             if {![info exists settings($k)]} { set settings($k) $v }
         }
@@ -303,6 +305,7 @@ namespace eval ::plugins::GrindAdvisor {
         dui page add GrindAdvisor_help -namespace true -theme default -type fpdialog
         dui page add GrindAdvisor_diagnostics -namespace true -theme default -type fpdialog
         dui page add GrindAdvisor_calculation_details -namespace true -theme default -type fpdialog
+        dui page add GrindAdvisor_dose_yield -namespace true -theme default -type fpdialog
         return GrindAdvisor_settings
     }
 
@@ -926,6 +929,123 @@ namespace eval ::plugins::GrindAdvisor {
         return [_calibration_confidence $rows]
     }
 
+    # ==================================================================
+    #  Dose / yield source mode (v2.3.0) -- DISPLAY ONLY.
+    #
+    #  Chooses which dose and yield values the plugin REPORTS (popup rows,
+    #  reason line, ratio, Diagnostics) per the dose_yield_mode setting:
+    #    fixed  -> always the set/target values (grinder_dose_weight,
+    #              target_drink_weight).
+    #    actual -> the measured values (a detected actual-dose column and
+    #              drink_weight), unless a measured value is 0/empty/missing,
+    #              which always fails and falls back to set (with a label).
+    #    auto   -> measured values only if they pass plausibility (dose
+    #              within [dose_min,dose_max]; yield ratio within
+    #              [ratio_min,ratio_max]); otherwise set (with a label).
+    #
+    #  This never touches the grind recommendation math or calibration
+    #  shot-matching -- both keep using set/target values (user decision,
+    #  v2.3.0). The resolver only affects what is DISPLAYED, and always
+    #  states which source was used (no silent fallback).
+    # ==================================================================
+    proc _setting_num {key default} {
+        set v [_to_float [_setting $key $default]]
+        if {$v eq ""} { return $default }
+        return $v
+    }
+
+    proc _fmt_g {v} {
+        if {$v eq ""} { return "n/a" }
+        return "[format %.1f $v]g"
+    }
+
+    # Label for a rejected measured value: distinguishes missing from 0.
+    proc _reject_lbl {act reason} {
+        if {$act eq ""} { return "no actual" }
+        return "actual [_fmt_g $act] $reason"
+    }
+
+    proc _resolve_dose {mode set_d act_d} {
+        switch -- $mode {
+            fixed {
+                return [list $set_d "set [_fmt_g $set_d]"]
+            }
+            actual {
+                if {$act_d ne "" && $act_d > 0} {
+                    return [list $act_d "actual [_fmt_g $act_d]"]
+                }
+                return [list $set_d "set [_fmt_g $set_d] ([_reject_lbl $act_d rejected])"]
+            }
+            default {
+                if {$act_d eq "" || $act_d <= 0} {
+                    return [list $set_d "set [_fmt_g $set_d] ([_reject_lbl $act_d rejected])"]
+                }
+                set lo [_setting_num dose_min 12.0]
+                set hi [_setting_num dose_max 22.0]
+                if {$act_d < $lo || $act_d > $hi} {
+                    return [list $set_d "set [_fmt_g $set_d] (actual [_fmt_g $act_d] out of range)"]
+                }
+                return [list $act_d "actual [_fmt_g $act_d]"]
+            }
+        }
+    }
+
+    # Yield resolves against the already-resolved dose (for the ratio check).
+    proc _resolve_yield {mode set_y act_y dose} {
+        switch -- $mode {
+            fixed {
+                return [list $set_y "set [_fmt_g $set_y]"]
+            }
+            actual {
+                if {$act_y ne "" && $act_y > 0} {
+                    return [list $act_y "actual [_fmt_g $act_y]"]
+                }
+                return [list $set_y "set [_fmt_g $set_y] ([_reject_lbl $act_y rejected])"]
+            }
+            default {
+                if {$act_y eq "" || $act_y <= 0} {
+                    return [list $set_y "set [_fmt_g $set_y] ([_reject_lbl $act_y rejected])"]
+                }
+                if {$dose ne "" && $dose > 0} {
+                    set ratio [expr {$act_y / double($dose)}]
+                    set lo [_setting_num ratio_min 1.0]
+                    set hi [_setting_num ratio_max 4.0]
+                    if {$ratio < $lo || $ratio > $hi} {
+                        return [list $set_y "set [_fmt_g $set_y] (actual [_fmt_g $act_y] out of ratio [format %.1f $ratio])"]
+                    }
+                }
+                return [list $act_y "actual [_fmt_g $act_y]"]
+            }
+        }
+    }
+
+    # Resolve effective dose/yield for a raw SDB row. Returns a dict:
+    #   dose yield  -> the effective numeric values ("" if none)
+    #   dose_src yield_src -> human labels ("actual 18.4g", "set 18.0g (...)")
+    #   ratio -> effective yield/dose ("" if not computable)
+    proc _effective_dose_yield {row} {
+        set mode [_setting dose_yield_mode auto]
+        set set_d [_to_float [_dget $row dose]]
+        set act_d [expr {[dict exists $row actual_dose] ? [_to_float [_dget $row actual_dose]] : ""}]
+        set set_y [_to_float [_dget $row set_yield]]
+        set act_y [_to_float [_dget $row actual_yield]]
+
+        lassign [_resolve_dose $mode $set_d $act_d] dose dose_src
+        lassign [_resolve_yield $mode $set_y $act_y $dose] yield yield_src
+
+        set ratio ""
+        if {$dose ne "" && $dose > 0 && $yield ne ""} {
+            set ratio [format %.1f [expr {$yield / double($dose)}]]
+        }
+        return [dict create dose $dose yield $yield \
+            dose_src $dose_src yield_src $yield_src ratio $ratio]
+    }
+
+    # Suffix appended to a reason line so the source is never silent.
+    proc _source_reason_suffix {dy} {
+        return " (dose: [dict get $dy dose_src]; yield: [dict get $dy yield_src])"
+    }
+
     proc analyze_latest_shot {} {
         lassign [locate_shot_source] db table fields
         if {$db eq "" || $table eq ""} {
@@ -956,14 +1076,18 @@ namespace eval ::plugins::GrindAdvisor {
                 "Latest shot is missing a numeric grind or time value."]
         }
 
-        set bag_shot [_bag_shot_count $current $rows 0]
-        if {$bag_shot ne ""} { dict set current bag_shot $bag_shot }
-        set channel_warning [_channel_warning $current $rows 1]
-        if {$channel_warning ne ""} { dict set current channel_warning $channel_warning }
+        # Regression Forecast recommendation (v3.0.0) for the latest shot.
+        set rec [_forecast_rec $rows $fields 0]
+        if {[dict size $rec] == 0} {
+            return [dict create ok 0 error \
+                "Latest shot is missing a numeric grind or time value."]
+        }
 
-        set previous [_find_calibration_shot $current $rows 1]
-        set rec [compute_recommendation $current $previous]
-        dict set rec ok 1
+        # Bag shot number and channel warning are display extras.
+        set bag_shot [_bag_shot_count $current $rows 0]
+        if {$bag_shot ne ""} { dict set rec bag_shot $bag_shot }
+        set channel_warning [_channel_warning $current $rows 1]
+        if {$channel_warning ne ""} { dict set rec channel_warning $channel_warning }
 
         # Display-only calibration confidence (v2.1.0); attached after the
         # recommendation is fully computed so it can never influence it.
@@ -975,11 +1099,20 @@ namespace eval ::plugins::GrindAdvisor {
 
         dict set rec timestamp [_dget $cur timestamp]
 
-        # Display extras (shown only when present in SDB).
-        set dose [_to_float [_dget $cur dose]]
-        if {$dose ne ""} { dict set rec dose $dose }
-        set set_yld [_to_float [_dget $cur set_yield]]
-        if {$set_yld ne ""} { dict set rec set_yield $set_yld }
+        # Display extras (shown only when present in SDB). Dose and yield come
+        # from the source-mode resolver (v2.3.0), so the popup reports the
+        # chosen source; the source is also stamped onto the reason line so
+        # it is never silent. This is display only -- the recommendation and
+        # calibration matching above already used set/target values.
+        set dy [_effective_dose_yield $cur]
+        if {[dict get $dy dose] ne ""} { dict set rec dose [dict get $dy dose] }
+        if {[dict get $dy yield] ne ""} { dict set rec set_yield [dict get $dy yield] }
+        dict set rec dose_src [dict get $dy dose_src]
+        dict set rec yield_src [dict get $dy yield_src]
+        if {[dict get $dy ratio] ne ""} { dict set rec ratio [dict get $dy ratio] }
+        if {[dict exists $rec reason]} {
+            dict set rec reason "[dict get $rec reason][_source_reason_suffix $dy]"
+        }
         set actual_yld [_to_float [_dget $cur actual_yield]]
         if {$actual_yld ne ""} { dict set rec actual_yield $actual_yld }
 
@@ -1052,32 +1185,6 @@ namespace eval ::plugins::GrindAdvisor {
         return $checked
     }
 
-    proc _find_calibration_shot {current rows {start 1}} {
-        set nrows [llength $rows]
-        if {[dict exists $current bag_key]} {
-            for {set pos $start} {$pos < $nrows} {incr pos} {
-                set shot [_shot_from_row [lindex $rows $pos]]
-                if {[dict size $shot] == 0} { continue }
-                if {![_same_bag $current $shot]} { continue }
-                if {![_recipe_matches $current $shot]} { continue }
-                if {abs([dict get $current grind] - [dict get $shot grind]) < 1e-9} { continue }
-                dict set shot calibration_source same_bag
-                return $shot
-            }
-            return {}
-        }
-
-        for {set pos $start} {$pos < $nrows} {incr pos} {
-            set shot [_shot_from_row [lindex $rows $pos]]
-            if {[dict size $shot] == 0} { continue }
-            if {![_recipe_matches $current $shot]} { continue }
-            if {abs([dict get $current grind] - [dict get $shot grind]) < 1e-9} { continue }
-            dict set shot calibration_source recent_recipe
-            return $shot
-        }
-        return {}
-    }
-
     proc _bag_shot_count {current rows {start 0}} {
         if {![dict exists $current bag_key]} { return "" }
         set count 0
@@ -1115,157 +1222,281 @@ namespace eval ::plugins::GrindAdvisor {
         return ""
     }
 
-    proc compute_recommendation {current {previous {}}} {
-        # Read via _setting so a missing/empty settings array can never crash
-        # the recommendation (the framework may create the array empty before
-        # our defaults load).
-        set target     [_setting target_time              28.0]
-        set def_spp    [_setting default_seconds_per_step 5.0]
-        set mode       [_setting recommendation_mode dynamic_barista]
+    # ==================================================================
+    #  Recommendation engine (v3.0.0): Regression Forecast ladder.
+    #
+    #  One non-selectable method. By eligible-shot count n on the CURRENT
+    #  bag (n resets when the bag changes):
+    #    n=1  change = (shot_time - target) / S_PER_STEP_DEFAULT * DAMP
+    #    n=2  same, but s/step = |(t2-t1)/(g2-g1)| when the grind moved and
+    #         |slope| >= SLOPE_MIN, else the default.
+    #    n>=3 recency-weighted least-squares of normalized time vs grind;
+    #         solve the fitted line for the grind that predicts the target.
+    #         Guards (all shots at one grind, or |m| < M_MIN) fall back to
+    #         the n=2 method, stated in the reason.
+    #
+    #  Verified against GrindAdvisor_Shot_Calculation2.xlsx "Forecast
+    #  Method": the five weighted sums, m=-4.0977, b=81.139, ideal grind
+    #  12.968 -> 13.0, predicted 27.87s all reproduce exactly.
+    #
+    #  Internal constants (documented in Help, never settings):
+    #    S_PER_STEP_DEFAULT 3.0  DAMP 0.5  SLOPE_MIN 0.1  M_MIN 0.5
+    #    DECAY 0.85  DOSE_SENS 1.8 s/g  OUTLIER 2.0 g  MIN_SHOTS 3
+    # ==================================================================
+    variable GA_S_PER_STEP_DEFAULT 3.0
+    variable GA_DAMP 0.5
+    variable GA_SLOPE_MIN 0.1
+    variable GA_M_MIN 0.5
+    variable GA_DECAY 0.85
+    variable GA_DOSE_SENS 1.8
+    variable GA_OUTLIER 2.0
+    variable GA_MIN_SHOTS 3
 
-        set grind  [dict get $current grind]
-        set actual [dict get $current duration]
+    proc _forecast_target {} {
+        set t [_to_float [_setting target_time 28.0]]
+        if {$t eq "" || $t <= 0} { return 28.0 }
+        return $t
+    }
 
-        set calibrated 0
-        set spp $def_spp
-        set source default_estimate
+    # Outlier: weighed dose or yield more than OUTLIER g from the set value
+    # (only checkable when the schema exposes the actual columns).
+    proc _is_outlier {row} {
+        variable GA_OUTLIER
+        set ds [_to_float [_dget $row dose]]
+        set ys [_to_float [_dget $row set_yield]]
+        set da [expr {[dict exists $row actual_dose] ? [_to_float [_dget $row actual_dose]] : ""}]
+        set ya [expr {[dict exists $row actual_yield] ? [_to_float [_dget $row actual_yield]] : ""}]
+        if {$da ne "" && $ds ne "" && abs($da - $ds) > $GA_OUTLIER} { return 1 }
+        if {$ya ne "" && $ys ne "" && abs($ya - $ys) > $GA_OUTLIER} { return 1 }
+        return 0
+    }
 
-        if {[dict size $previous] > 0} {
-            set pg [dict get $previous grind]
-            set pt [dict get $previous duration]
-            set grind_change [expr {$grind - $pg}]
-            set time_change  [expr {$actual - $pt}]
-            if {abs($grind_change) >= 1e-9} {
-                set spp [expr {abs($time_change / double($grind_change))}]
-                if {$spp > 1e-6} {
-                    set calibrated 1
-                    if {[dict exists $previous calibration_source]} {
-                        set source [dict get $previous calibration_source]
-                    } else {
-                        set source recent_recipe
-                    }
+    # Normalized time: scales out yield weighing error and dose error.
+    # Returns {t_norm active}. active=0 with no scale data -> raw time.
+    proc _norm_time {row} {
+        variable GA_DOSE_SENS
+        set st [_duration_seconds [_dget $row duration]]
+        if {$st eq ""} { return [list "" 0] }
+        set ys [_to_float [_dget $row set_yield]]
+        set ya [expr {[dict exists $row actual_yield] ? [_to_float [_dget $row actual_yield]] : ""}]
+        set ds [_to_float [_dget $row dose]]
+        set da [expr {[dict exists $row actual_dose] ? [_to_float [_dget $row actual_dose]] : ""}]
+        set tnorm $st
+        set active 0
+        if {$ya ne "" && $ya > 0 && $ys ne ""} {
+            set tnorm [expr {$tnorm * ($ys / double($ya))}]
+            set active 1
+        }
+        if {$da ne "" && $ds ne ""} {
+            set tnorm [expr {$tnorm - ($da - $ds) * $GA_DOSE_SENS}]
+            set active 1
+        }
+        return [list $tnorm $active]
+    }
+
+    # Current-bag eligible dataset from row index 'start' (newest-first).
+    # Returns {shots excluded}. Same-bag when the schema has bag fields;
+    # otherwise the recent valid run is treated as the current bag.
+    proc _bag_forecast_shots {rows fields start} {
+        set out {}
+        set excluded 0
+        set nrows [llength $rows]
+        if {$start >= $nrows} { return [dict create shots {} excluded 0] }
+        set cur [_shot_from_row [lindex $rows $start]]
+        set has_bag [dict exists $cur bag_key]
+        for {set pos $start} {$pos < $nrows} {incr pos} {
+            set r [lindex $rows $pos]
+            set sh [_shot_from_row $r]
+            if {[dict size $sh] == 0} { continue }
+            if {$has_bag && ![_same_bag $cur $sh]} { continue }
+            if {[_is_outlier $r]} { incr excluded; continue }
+            lassign [_norm_time $r] tnorm active
+            if {$tnorm eq ""} { continue }
+            lappend out [dict create grind [dict get $sh grind] \
+                t_raw [dict get $sh duration] t_norm $tnorm norm_active $active]
+        }
+        return [dict create shots $out excluded $excluded]
+    }
+
+    # Recency-weighted least-squares of y vs grind (ynorm=1 -> t_norm,
+    # else t_raw), newest-first with DECAY^index weights. R2 is the ordinary
+    # (unweighted) goodness-of-fit of the fitted line (the sheet's "model
+    # fit"). Returns {ok 1 m b r2 normalized} or {ok 0 why ...}.
+    proc _weighted_regression {shots ynorm} {
+        variable GA_DECAY
+        set n [llength $shots]
+        set Sw 0.0; set Swx 0.0; set Swy 0.0; set Swxx 0.0; set Swxy 0.0
+        set distinct {}
+        set normalized 0
+        set xs {}; set ysv {}
+        for {set k 0} {$k < $n} {incr k} {
+            set s [lindex $shots $k]
+            set x [dict get $s grind]
+            if {$ynorm} { set y [dict get $s t_norm] } else { set y [dict get $s t_raw] }
+            if {[dict get $s norm_active]} { set normalized 1 }
+            set w [expr {pow($GA_DECAY, $k)}]
+            set Sw   [expr {$Sw   + $w}]
+            set Swx  [expr {$Swx  + $w*$x}]
+            set Swy  [expr {$Swy  + $w*$y}]
+            set Swxx [expr {$Swxx + $w*$x*$x}]
+            set Swxy [expr {$Swxy + $w*$x*$y}]
+            lappend xs $x; lappend ysv $y
+            if {[lsearch -exact $distinct $x] < 0} { lappend distinct $x }
+        }
+        if {[llength $distinct] < 2} { return [dict create ok 0 why "all shots at one grind"] }
+        set denom [expr {$Sw*$Swxx - $Swx*$Swx}]
+        if {abs($denom) < 1e-9} { return [dict create ok 0 why "degenerate fit"] }
+        set m [expr {($Sw*$Swxy - $Swx*$Swy) / double($denom)}]
+        set b [expr {($Swy - $m*$Swx) / double($Sw)}]
+        set my 0.0
+        foreach y $ysv { set my [expr {$my + $y}] }
+        set my [expr {$my / double($n)}]
+        set sst 0.0; set ssr 0.0
+        foreach x $xs y $ysv {
+            set p [expr {$m*$x + $b}]
+            set sst [expr {$sst + ($y-$my)*($y-$my)}]
+            set ssr [expr {$ssr + ($y-$p)*($y-$p)}]
+        }
+        set r2 ""
+        if {$sst > 1e-9} { set r2 [expr {1.0 - $ssr/$sst}] }
+        return [dict create ok 1 m $m b $b r2 $r2 normalized $normalized]
+    }
+
+    proc _forecast_round {x} {
+        return [_clamp_grind [_round_grind $x]]
+    }
+
+    # n=1 / n=2 rungs (also the tripped-regression fallback). Uses RAW time.
+    proc _ladder_small {shots} {
+        variable GA_S_PER_STEP_DEFAULT
+        variable GA_DAMP
+        variable GA_SLOPE_MIN
+        set target [_forecast_target]
+        set n [llength $shots]
+        set latest [lindex $shots 0]
+        set grind [dict get $latest grind]
+        set st [dict get $latest t_raw]
+        set sps $GA_S_PER_STEP_DEFAULT
+        set method first_shot
+        set rc "First shot"
+        if {$n >= 2} {
+            set prev [lindex $shots 1]
+            set dg [expr {$grind - [dict get $prev grind]}]
+            if {abs($dg) >= 1e-9} {
+                set slope [expr {abs(($st - [dict get $prev t_raw]) / double($dg))}]
+                if {$slope >= $GA_SLOPE_MIN} {
+                    set sps $slope; set method two_shot; set rc "2-shot calibration"
                 }
             }
         }
-
-        # Guard against a degenerate seconds-per-step.
-        if {$spp <= 1e-6} {
-            set spp $def_spp
-            set calibrated 0
-            set source default_estimate
-        }
-
-        set error [expr {$target - $actual}]
-        set cap [_cap_for_mode $mode [expr {abs($error)}] $calibrated]
-        set raw_adj [expr {$error / double($spp)}]
-        set raw_next [expr {$grind - $raw_adj}]
-        set cap_applied 0
-        if {$raw_adj > $cap} {
-            set adj $cap
-            set cap_applied 1
-        } elseif {$raw_adj < -$cap} {
-            set adj [expr {-$cap}]
-            set cap_applied 1
-        } else {
-            set adj $raw_adj
-        }
-
-        if {abs($error) < 0.5} {
-            set adj 0.0
-            set cap_applied 0
-        }
-
-        set next [expr {$grind - $adj}]
-        set next [_round_grind $next]
-        set next [_clamp_grind $next]
-        lassign [_grinder_range] grinder_min grinder_max
-        set rounding_increment [_safe_rounding_increment]
-
-        set rec [dict create \
-            grind      $grind \
-            actual     $actual \
-            target     $target \
-            next       $next \
-            spp        $spp \
-            error      $error \
-            adjustment $adj \
-            raw_adjustment $raw_adj \
-            raw_next   $raw_next \
-            cap        $cap \
-            cap_applied $cap_applied \
-            rounding_increment $rounding_increment \
-            grinder_min $grinder_min \
-            grinder_max $grinder_max \
-            source     $source \
-            mode       $mode \
-            mode_label [_mode_label $mode] \
-            reason     [_recommendation_reason $error $calibrated $source $current] \
-            calibrated $calibrated]
-
-        foreach k {bag_shot channel_warning} {
-            if {[dict exists $current $k]} { dict set rec $k [dict get $current $k] }
-        }
-        return $rec
+        set change [expr {($st - $target) / double($sps) * $GA_DAMP}]
+        set next [_forecast_round [expr {$grind + $change}]]
+        return [dict create method $method next $next m "" b "" r2 "" r2raw "" \
+            n $n normalized 0 predicted_time "" s_per_step $sps reason_core $rc]
     }
 
-    proc _mode_label {mode} {
-        switch -- $mode {
-            conservative { return "Conservative" }
-            normal { return "Normal" }
-            aggressive_new_bean { return "Aggressive New Bean" }
-            default { return "Dynamic Barista" }
-        }
-    }
-
-    proc _cap_for_mode {mode abs_error calibrated} {
-        switch -- $mode {
-            conservative { return 1.0 }
-            normal { return 1.5 }
-            aggressive_new_bean {
-                if {$calibrated} { return 4.0 }
-                return 3.0
+    # The ladder: choose the rung by eligible count n.
+    proc _compute_forecast {shots} {
+        variable GA_MIN_SHOTS
+        variable GA_M_MIN
+        set target [_forecast_target]
+        set n [llength $shots]
+        if {$n >= $GA_MIN_SHOTS} {
+            set reg [_weighted_regression $shots 1]
+            if {[dict get $reg ok]} {
+                set m [dict get $reg m]; set b [dict get $reg b]
+                if {abs($m) >= $GA_M_MIN} {
+                    set ideal [expr {($target - $b) / double($m)}]
+                    set next [_forecast_round $ideal]
+                    set pred [expr {$m*$next + $b}]
+                    set regraw [_weighted_regression $shots 0]
+                    set r2raw [expr {[dict get $regraw ok] ? [dict get $regraw r2] : ""}]
+                    return [dict create method regression next $next m $m b $b \
+                        r2 [dict get $reg r2] r2raw $r2raw n $n \
+                        normalized [dict get $reg normalized] \
+                        predicted_time $pred s_per_step "" \
+                        reason_core "Regression over $n shots"]
+                }
+                set why "slope [format %.2f $m] too flat"
+            } else {
+                set why [dict get $reg why]
             }
-            default {
-                return [_dynamic_cap $abs_error $calibrated]
-            }
+            set fb [_ladder_small $shots]
+            dict set fb method regression_fallback
+            dict set fb reason_core "Regression fallback: $why"
+            dict set fb n $n
+            return $fb
+        }
+        return [_ladder_small $shots]
+    }
+
+    proc _forecast_reason {fc next} {
+        set core [dict get $fc reason_core]
+        if {[dict get $fc method] eq "regression"} {
+            return "$core (slope [format %.2f [dict get $fc m]] s/grind, predicts [format %.1f [dict get $fc predicted_time]]s at [format %.1f $next])."
+        }
+        return "$core (s/step [format %.1f [dict get $fc s_per_step]])."
+    }
+
+    proc _forecast_method_label {method} {
+        switch -- $method {
+            first_shot          { return "First shot" }
+            two_shot            { return "2-shot calibration" }
+            regression          { return "Regression forecast" }
+            regression_fallback { return "Regression fallback (pairwise)" }
+            default             { return $method }
         }
     }
 
-    proc _dynamic_cap {abs_error calibrated} {
-        if {$abs_error <= 2.0} { return 0.25 }
-        if {$abs_error <= 5.0} {
-            if {$calibrated} { return 0.75 }
-            return 0.5
-        }
-        if {$abs_error <= 10.0} {
-            if {$calibrated} { return 2.5 }
-            return 1.25
-        }
-        if {$abs_error <= 15.0} {
-            if {$calibrated} { return 3.0 }
-            return 2.0
-        }
-        if {$calibrated} { return 3.5 }
-        return 2.5
+    proc _forecast_excluded_txt {rec} {
+        set ex [expr {[dict exists $rec excluded] ? [dict get $rec excluded] : 0}]
+        if {$ex > 0} { return ", $ex outlier(s) excluded" }
+        return ""
     }
 
-    proc _recommendation_reason {error calibrated source current} {
-        if {abs($error) < 0.5} { return "Near target, keep grind." }
-        if {$error > 0} {
-            set prefix "Fast shot"
-        } else {
-            set prefix "Slow shot"
+    proc _forecast_r2_txt {rec} {
+        set r2 [_dget $rec r2]
+        if {$r2 eq ""} { return "n/a" }
+        set out [format %.2f $r2]
+        set r2r [_dget $rec r2raw]
+        if {[dict get $rec normalized] && $r2r ne "" && $r2r ne $r2} {
+            append out " (normalized; raw [format %.2f $r2r])"
         }
-        if {$calibrated && $source eq "same_bag"} {
-            return "$prefix, calibrated from same bag."
+        return $out
+    }
+
+    # Full recommendation dict for the shot at row index 'pos', using the
+    # current-bag eligible dataset from pos onward.
+    proc _forecast_rec {rows fields pos} {
+        set cur [_shot_from_row [lindex $rows $pos]]
+        if {[dict size $cur] == 0} { return {} }
+        set elig [_bag_forecast_shots $rows $fields $pos]
+        set shots [dict get $elig shots]
+        if {[llength $shots] == 0} {
+            lassign [_norm_time [lindex $rows $pos]] tn ac
+            if {$tn eq ""} { set tn [dict get $cur duration]; set ac 0 }
+            set shots [list [dict create grind [dict get $cur grind] \
+                t_raw [dict get $cur duration] t_norm $tn norm_active $ac]]
         }
-        if {$calibrated} {
-            return "$prefix, calibrated from matching recipe."
-        }
-        if {[dict exists $current bag_key]} {
-            return "$prefix, same bag calibration unavailable."
-        }
-        return "$prefix, using default estimate."
+        set fc [_compute_forecast $shots]
+        set grind [dict get $cur grind]
+        set actual [dict get $cur duration]
+        set target [_forecast_target]
+        set next [dict get $fc next]
+        lassign [_grinder_range] gmin gmax
+        set r2raw [expr {[dict exists $fc r2raw] ? [dict get $fc r2raw] : ""}]
+        return [dict create ok 1 \
+            grind $grind actual $actual target $target next $next \
+            error [expr {$target - $actual}] \
+            reason [_forecast_reason $fc $next] \
+            method [dict get $fc method] \
+            m [dict get $fc m] b [dict get $fc b] r2 [dict get $fc r2] r2raw $r2raw \
+            n [dict get $fc n] normalized [dict get $fc normalized] \
+            excluded [dict get $elig excluded] \
+            predicted_time [dict get $fc predicted_time] \
+            s_per_step [dict get $fc s_per_step] \
+            rounding_increment [_safe_rounding_increment] \
+            grinder_min $gmin grinder_max $gmax]
     }
 
     proc _round_grind {value} {
@@ -1440,7 +1671,7 @@ namespace eval ::plugins::GrindAdvisor {
         variable field_patterns
         set assigned {}
         set result {}
-        foreach field {grind dose set_yield actual_yield timestamp duration profile bev_type filename removed} {
+        foreach field {grind dose set_yield actual_yield actual_dose timestamp duration profile bev_type filename removed} {
             foreach pat $field_patterns($field) {
                 foreach c $cols {
                     if {[dict exists $assigned $c]} { continue }
@@ -1481,7 +1712,7 @@ namespace eval ::plugins::GrindAdvisor {
         set sel {}
         set order {}
         set selected {}
-        foreach field {grind duration dose set_yield actual_yield timestamp profile bev_type filename removed} {
+        foreach field {grind duration dose set_yield actual_yield actual_dose timestamp profile bev_type filename removed} {
             if {[dict exists $fields $field]} {
                 set col [dict get $fields $field]
                 if {![dict exists $selected $col]} {
@@ -1637,7 +1868,7 @@ namespace eval ::plugins::GrindAdvisor {
             lappend lines "Dose: [format %.1f [dict get $rec dose]]g"
         }
         if {[dict exists $rec set_yield]} {
-            lappend lines "Set Yield: [format %.1f [dict get $rec set_yield]]g"
+            lappend lines "Yield: [format %.1f [dict get $rec set_yield]]g"
         }
         if {[dict exists $rec bag_shot]} {
             lappend lines "Bag Shot: #[dict get $rec bag_shot]"
@@ -1819,13 +2050,17 @@ namespace eval ::plugins::GrindAdvisor {
                     set dirline "coarser by [format %.1f [expr {abs($delta)}]]"
                 }
 
-                # Detail rows (label/value grid).
+                # Detail rows (label/value grid). Dose/Yield reflect the
+                # source mode (v2.3.0); the exact source is on the reason line.
                 set rows [list "Time" "${a}s  (target ${t}s)"]
                 if {[dict exists $rec dose]} {
                     lappend rows "Dose" "[format %.1f [dict get $rec dose]]g"
                 }
                 if {[dict exists $rec set_yield]} {
-                    lappend rows "Set Yield" "[format %.1f [dict get $rec set_yield]]g"
+                    lappend rows "Yield" "[format %.1f [dict get $rec set_yield]]g"
+                }
+                if {[dict exists $rec ratio]} {
+                    lappend rows "Ratio" "1:[dict get $rec ratio]"
                 }
                 if {[dict exists $rec bag_shot]} {
                     lappend rows "Bag Shot" "#[dict get $rec bag_shot]"
@@ -2015,24 +2250,19 @@ namespace eval ::plugins::GrindAdvisor {
             set row_pitch [expr {int($fbody * 175 / 100)}]
             set reason_lineh [expr {int($fbody * 135 / 100)}]
 
-            switch -- [_dget $rec source] {
-                same_bag      { set src "calibrated from same bag" }
-                recent_recipe { set src "calibrated from matching recipe" }
-                default       { set src "default estimate" }
-            }
-            if {[dict get $rec cap_applied]} {
-                set cap_text "yes  (\u00B1[_fmt_num [dict get $rec cap]])"
-            } else {
-                set cap_text "no  (limit \u00B1[_fmt_num [dict get $rec cap]])"
-            }
             set rows [list \
-                "Mode" [dict get $rec mode_label] \
-                "Shot time" "[_fmt_num [dict get $rec actual]]s  (target [_fmt_num [dict get $rec target]]s)" \
-                "Seconds per step" "[_fmt_num [dict get $rec spp]]  ($src)" \
-                "Raw next grind" [_fmt_num [dict get $rec raw_next]] \
-                "Cap applied" $cap_text \
-                "Rounded" "to [_fmt_num [dict get $rec rounding_increment]] \u2192 [_fmt_num [dict get $rec next]]" \
-                "Grinder range" "[_fmt_num [dict get $rec grinder_min]] \u2013 [_fmt_num [dict get $rec grinder_max]]"]
+                "Method" [_forecast_method_label [_dget $rec method]] \
+                "Bag shots (n)" "[_dget $rec n] eligible[_forecast_excluded_txt $rec]" \
+                "Shot time" "[_fmt_num [dict get $rec actual]]s  (target [_fmt_num [dict get $rec target]]s)"]
+            if {[dict get $rec method] eq "regression"} {
+                lappend rows "Learned slope" "[_fmt_num [dict get $rec m]] s/grind" \
+                    "Model fit R\u00B2" [_forecast_r2_txt $rec] \
+                    "Predicted time" "[_fmt_num [dict get $rec predicted_time]]s at [_fmt_num [dict get $rec next]]"
+            } else {
+                lappend rows "Seconds per step" [_fmt_num [dict get $rec s_per_step]]
+            }
+            lappend rows "Rounded" "to [_fmt_num [dict get $rec rounding_increment]] \u2192 [_fmt_num [dict get $rec next]]" \
+                "Grinder range" "[_fmt_num [dict get $rec grinder_min]] \u2013 [_fmt_num [dict get $rec grinder_max]]"
             set nrows [expr {[llength $rows] / 2}]
 
             set reason ""
@@ -2236,12 +2466,11 @@ namespace eval ::plugins::GrindAdvisor {
             set actual_y [_to_float [_dget $r actual_yield]]
 
             set current [_shot_from_row $r]
+            set rec [_forecast_rec $rows $fields $pos]
             set bag_shot [_bag_shot_count $current $rows $pos]
-            if {$bag_shot ne ""} { dict set current bag_shot $bag_shot }
+            if {$bag_shot ne ""} { dict set rec bag_shot $bag_shot }
             set warning [_channel_warning $current $rows [expr {$pos + 1}]]
-            if {$warning ne ""} { dict set current channel_warning $warning }
-            set previous [_find_calibration_shot $current $rows [expr {$pos + 1}]]
-            set rec [compute_recommendation $current $previous]
+            if {$warning ne ""} { dict set rec channel_warning $warning }
 
             set l1 {}
             if {[_setting history_show_datetime 1]} {
@@ -2508,7 +2737,7 @@ namespace eval ::plugins::GrindAdvisor {
             "Detected SDB table: $table" \
             "Detected grind column: [_field_debug_value $fields grind]" \
             "Detected set dose column: [_field_debug_value $fields dose]" \
-            "Detected set ratio column: computed from set dose + set yield" \
+            "Detected actual dose column: [_field_debug_value $fields actual_dose]" \
             "Detected set yield column: [_field_debug_value $fields set_yield]" \
             "Detected actual yield column: [_field_debug_value $fields actual_yield]" \
             "Detected shot time column: [_field_debug_value $fields duration]" \
@@ -2516,6 +2745,10 @@ namespace eval ::plugins::GrindAdvisor {
             "Detected filename column: [_field_debug_value $fields filename]" \
             "Detected removed-flag column: [_field_debug_value $fields removed]" \
             "Deleted-shot file check: [expr {[llength [_history_dirs]] > 0 ? "active (history folder found)" : "off (history folder not found)"}]" \
+            "" \
+            "Dose/yield source mode: [_dose_yield_mode_label [_setting dose_yield_mode auto]]" \
+            "Dose plausibility (Auto): [_fmt_num [_setting dose_min 12.0]] - [_fmt_num [_setting dose_max 22.0]] g" \
+            "Ratio plausibility (Auto): [_fmt_num [_setting ratio_min 1.0]] - [_fmt_num [_setting ratio_max 4.0]]" \
             "" \
             "Per-shot input/intermediate trace: see Calculation Details."]
         return [join $lines "\n"]
@@ -2539,7 +2772,7 @@ namespace eval ::plugins::GrindAdvisor {
         if {[llength $rows] == 0} {
             return "Recent shot trace: no valid espresso shots."
         }
-        set lines [list "Recent shot trace (newest first; same procs the popup uses):"]
+        set lines [list "Recent shot trace (newest first; same engine the popup uses):"]
         set nrows [llength $rows]
         set idx 1
         for {set pos 0} {$pos < $nrows && $idx <= $limit} {incr pos} {
@@ -2547,31 +2780,28 @@ namespace eval ::plugins::GrindAdvisor {
             set current [_shot_from_row $r]
             if {[dict size $current] == 0} { continue }
             set bag_shot [_bag_shot_count $current $rows $pos]
-            if {$bag_shot ne ""} { dict set current bag_shot $bag_shot }
-            set previous [_find_calibration_shot $current $rows [expr {$pos + 1}]]
-            set rec [compute_recommendation $current $previous]
+            set rec [_forecast_rec $rows $fields $pos]
+            if {[dict size $rec] == 0} { continue }
 
             set dt [_format_clock [_dget $r timestamp]]
             if {$dt eq ""} { set dt "(no timestamp)" }
-            set dose [_to_float [_dget $r dose]]
-            set dose_t [expr {$dose ne "" ? "[_fmt_num $dose]g" : "-"}]
-            set yld [_to_float [_dget $r set_yield]]
-            set yld_t [expr {$yld ne "" ? "[_fmt_num $yld]g" : "-"}]
+            set dy [_effective_dose_yield $r]
             set bag_t [expr {$bag_shot ne "" ? "#$bag_shot" : "-"}]
-            switch -- [_dget $rec source] {
-                same_bag      { set src "same bag" }
-                recent_recipe { set src "recipe" }
-                default       { set src "default est" }
-            }
-            if {[dict get $rec cap_applied]} { set cap_t "cap [_fmt_num [dict get $rec cap]] HIT" } else { set cap_t "cap [_fmt_num [dict get $rec cap]]" }
+            set ratio_t [expr {[dict get $dy ratio] ne "" ? "1:[dict get $dy ratio]" : "-"}]
 
-            lappend lines [format "%d) %s | grind %s time %ss target %ss err %+.1f | dose %s yield %s bag %s" \
+            lappend lines [format "%d) %s | grind %s time %ss target %ss err %+.1f | bag %s" \
                 $idx $dt [_fmt_num [dict get $rec grind]] [_fmt_num [dict get $rec actual]] \
-                [_fmt_num [dict get $rec target]] [dict get $rec error] $dose_t $yld_t $bag_t]
-            lappend lines [format "   spp %s (%s) | %s | raw %s -> rec %s | %s" \
-                [_fmt_num [dict get $rec spp]] $src $cap_t \
-                [_fmt_num [dict get $rec raw_next]] [_fmt_num [dict get $rec next]] \
-                [dict get $rec reason]]
+                [_fmt_num [dict get $rec target]] [dict get $rec error] $bag_t]
+            lappend lines "   dose [dict get $dy dose_src] | yield [dict get $dy yield_src] | ratio $ratio_t"
+            if {[dict get $rec method] eq "regression"} {
+                lappend lines [format "   %s: n=%s m=%s b=%s R2=%s -> rec %s (pred %ss)" \
+                    [_forecast_method_label [dict get $rec method]] [dict get $rec n] \
+                    [_fmt_num [dict get $rec m]] [_fmt_num [dict get $rec b]] \
+                    [_forecast_r2_txt $rec] [_fmt_num [dict get $rec next]] \
+                    [_fmt_num [dict get $rec predicted_time]]]
+            } else {
+                lappend lines "   [_forecast_method_label [dict get $rec method]]: n=[dict get $rec n] s/step [_fmt_num [dict get $rec s_per_step]] -> rec [_fmt_num [dict get $rec next]]"
+            }
             incr idx
         }
         return [join $lines "\n"]
@@ -2585,24 +2815,48 @@ namespace eval ::plugins::GrindAdvisor {
             }
             return "Calculation Diagnostics:\nLatest recommendation unavailable."
         }
-        if {[dict get $rec cap_applied]} {
-            set cap_text "yes"
-        } else {
-            set cap_text "no"
-        }
+        set dose_src [expr {[dict exists $rec dose_src] ? [dict get $rec dose_src] : "n/a"}]
+        set yield_src [expr {[dict exists $rec yield_src] ? [dict get $rec yield_src] : "n/a"}]
+        set ratio_txt [expr {[dict exists $rec ratio] ? "1:[dict get $rec ratio]" : "n/a"}]
+        set norm_txt [expr {[dict get $rec normalized] ? "active (yield/dose)" : "off (no scale data or no correction)"}]
         set lines [list \
             "Calculation Diagnostics:" \
-            "Recommendation mode: [dict get $rec mode_label]" \
+            "Method: [_forecast_method_label [dict get $rec method]]" \
+            "Eligible bag shots (n): [dict get $rec n]" \
+            "Outliers excluded: [dict get $rec excluded]" \
+            "Normalization: $norm_txt" \
+            "Dose/yield source mode: [_dose_yield_mode_label [_setting dose_yield_mode auto]]" \
+            "Dose used: $dose_src" \
+            "Yield used: $yield_src" \
+            "Ratio (yield/dose): $ratio_txt" \
             "Current grind: [_fmt_num [dict get $rec grind]]" \
             "Target time: [_fmt_num [dict get $rec target]]s" \
-            "Actual time: [_fmt_num [dict get $rec actual]]s" \
-            "Seconds per grind step: [_fmt_num [dict get $rec spp]]" \
-            "Raw next grind before cap/rounding: [_fmt_num [dict get $rec raw_next]]" \
-            "Cap applied: $cap_text" \
+            "Actual time: [_fmt_num [dict get $rec actual]]s"]
+        if {[dict get $rec method] eq "regression"} {
+            lappend lines \
+                "Learned slope m: [_fmt_num [dict get $rec m]] s/grind" \
+                "Intercept b: [_fmt_num [dict get $rec b]] s" \
+                "Model fit R2: [_forecast_r2_txt $rec]" \
+                "Ideal grind (predicts target): [_fmt_num [expr {([dict get $rec target] - [dict get $rec b]) / double([dict get $rec m])}]]" \
+                "Predicted time at recommendation: [_fmt_num [dict get $rec predicted_time]]s"
+        } else {
+            lappend lines "Seconds per step: [_fmt_num [dict get $rec s_per_step]]"
+        }
+        lappend lines \
             "Rounded final grind: [_fmt_num [dict get $rec next]]" \
             "Rounding increment: [_fmt_num [dict get $rec rounding_increment]]" \
-            "Grinder min/max: [_fmt_num [dict get $rec grinder_min]] / [_fmt_num [dict get $rec grinder_max]]"]
+            "Grinder min/max: [_fmt_num [dict get $rec grinder_min]] / [_fmt_num [dict get $rec grinder_max]]" \
+            "" \
+            "Constants: s/step default 3.0, damping 0.5, decay 0.85, dose sens 1.8 s/g, outlier 2.0 g, min shots 3."
         return [join $lines "\n"]
+    }
+
+    proc _dose_yield_mode_label {mode} {
+        switch -- $mode {
+            fixed  { return "Fixed (set values)" }
+            actual { return "Actual (measured)" }
+            default { return "Auto (measured if plausible)" }
+        }
     }
 }
 
@@ -2612,7 +2866,6 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
     variable data
     array set data {
         popup_theme_value {}
-        mode_value {}
         rounding_value {}
         enable_popup_value {}
     }
@@ -2680,15 +2933,16 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
             -command ::plugins::GrindAdvisor::_show_history_dialog \
             -label_font $L(font_button) -style ga_btn
 
-        # --- RIGHT column: Recommendation (3 rows: two controls + the
+        # --- RIGHT column: Recommendation (2 rows: rounding control + the
         # --- calibration-accuracy gauge), then Popup. Rows use the
         # --- card-relative grid: label / value / right-aligned button.
+        # (v3.0.0: the recommendation-mode selector is gone -- there is one
+        # built-in Regression Forecast method, no modes.)
         foreach {card_tag card_title card_y card_h rows} [list \
-            sec_reco "Recommendation" $L(sec_top) $three_h {
+            sec_reco "Recommendation" $L(sec_top) $two_h {
                 rounding "Grind rounding increment" rounding_value "Next" cycle_rounding
-                mode "Recommendation mode" mode_value "Next" cycle_mode
             } \
-            sec_popup "Popup" [expr {$L(sec_top) + $three_h + $L(sec_gap)}] $two_h {
+            sec_popup "Popup" [expr {$L(sec_top) + $two_h + $L(sec_gap)}] $two_h {
                 theme "Popup theme" popup_theme_value "Toggle" toggle_popup_theme
                 popup "Automatic popup" enable_popup_value "Toggle" toggle_enable_popup
             }] {
@@ -2714,11 +2968,11 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
             }
         }
 
-        # Calibration Accuracy gauge: third row of the Recommendation card.
+        # Calibration Accuracy gauge: second row of the Recommendation card.
         # 10 rounded segments at the value column; score text (caption size,
         # so "100% -- Excellent" always fits) to their right; no button.
         set reco_rows_y [expr {$L(sec_top) + $L(sec_pad) + $L(sec_title_h) + $L(md)}]
-        set gy [expr {$reco_rows_y + 2 * $L(row_pitch)}]
+        set gy [expr {$reco_rows_y + 1 * $L(row_pitch)}]
         set gmid [expr {$gy + $L(btn_h) / 2}]
         set glab_x [expr {$c2x + $L(sec_pad)}]
         set gval_x [expr {$c2x + $L(sec_value_dx)}]
@@ -2757,7 +3011,6 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
     proc refresh_values {page} {
         variable data
         set data(popup_theme_value) [string totitle $::plugins::GrindAdvisor::settings(popup_theme)]
-        set data(mode_value) [::plugins::GrindAdvisor::_mode_label $::plugins::GrindAdvisor::settings(recommendation_mode)]
         set data(rounding_value) $::plugins::GrindAdvisor::settings(grind_rounding_increment)
         if {[string is true -strict $::plugins::GrindAdvisor::settings(enable_popup)]} {
             set data(enable_popup_value) [translate "On"]
@@ -2765,7 +3018,6 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
             set data(enable_popup_value) [translate "Off"]
         }
         catch { dui item config $page popup_theme_value -text $data(popup_theme_value) }
-        catch { dui item config $page mode_value -text $data(mode_value) }
         catch { dui item config $page rounding_value -text $data(rounding_value) }
         catch { dui item config $page enable_popup_value -text $data(enable_popup_value) }
         refresh_confidence $page
@@ -2808,16 +3060,6 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
         } else {
             set ::plugins::GrindAdvisor::settings(popup_theme) light
         }
-        save_settings
-        refresh_values GrindAdvisor_settings
-    }
-
-    proc cycle_mode {} {
-        set values {conservative normal dynamic_barista aggressive_new_bean}
-        set idx [lsearch -exact $values $::plugins::GrindAdvisor::settings(recommendation_mode)]
-        if {$idx < 0} { set idx 1 }
-        set idx [expr {($idx + 1) % [llength $values]}]
-        set ::plugins::GrindAdvisor::settings(recommendation_mode) [lindex $values $idx]
         save_settings
         refresh_values GrindAdvisor_settings
     }
@@ -2917,54 +3159,46 @@ namespace eval ::dui::pages::GrindAdvisor_advanced {
             -text "Grind Advisor $::plugins::GrindAdvisor::version \u2014 tuning and tools" \
             -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor center -justify center
 
-        # v2.0.1 section cards. Tuning entries split across two titled cards
-        # (all numeric inputs stay in the top half of the screen), tools in a
-        # full-width card below.
+        # v3.0.0 section cards. The Regression Forecast method has no user
+        # tuning (its constants are fixed), so only Popup Tuning remains,
+        # numeric entries in the top half of the screen, tools below.
         set col_w $L(sec_col_w)
         set c2x $L(sec_col2_x)
-        set calc_h [expr {2 * $L(sec_pad) + $L(sec_title_h) + $L(md) + 3 * $L(entry_row_pitch) - $L(md)}]
         set ptun_h [expr {2 * $L(sec_pad) + $L(sec_title_h) + $L(md) + 2 * $L(entry_row_pitch) - $L(md)}]
-        set tools_h [expr {2 * $L(sec_pad) + $L(sec_title_h) + $L(md) + 2 * $L(row_pitch) - $L(md)}]
+        set tools_h [expr {2 * $L(sec_pad) + $L(sec_title_h) + $L(md) + 3 * $L(row_pitch) - $L(md)}]
 
-        foreach {card_tag card_title card_x card_h rows} [list \
-            sec_calc "Calculation Tuning" $lx $calc_h {
-                default_seconds_per_step "Seconds per grind step"
-                first_cap "First-shot max adjust"
-                later_cap "Later-shot max adjust"
-            } \
-            sec_ptun "Popup Tuning" $c2x $ptun_h {
-                popup_delay_ms "Popup delay (ms)"
-                popup_font_scale "Popup font scale"
-            }] {
-            set rows_y [::plugins::GrindAdvisor::_sec_card $page $card_tag $card_x $L(sec_top) $col_w $card_h $card_title]
-            set lab_x [expr {$card_x + $L(sec_pad)}]
-            set ent_x [expr {$card_x + $L(sec_value_dx)}]
-            set row 0
-            foreach {key label} $rows {
-                set ry [expr {$rows_y + $row * $L(entry_row_pitch)}]
-                set mid [expr {$ry + $L(entry_row_h) / 2}]
-                dui add dtext $page $lab_x $mid -tags ${key}_label -text [translate $label] \
-                    -font $L(font_body) -width $L(sec_label_w) -fill "#444444" -anchor w -justify left
-                dui add entry $page $ent_x $mid -tags $key \
-                    -textvariable ::plugins::GrindAdvisor::settings($key) \
-                    -width 8 -font $L(font_body) -canvas_anchor w \
-                    -borderwidth 1 -bg #fbfaff -foreground #4e85f4 -relief flat
-                incr row
-            }
+        set rows_y [::plugins::GrindAdvisor::_sec_card $page sec_ptun $lx $L(sec_top) $col_w $ptun_h "Popup Tuning"]
+        set lab_x [expr {$lx + $L(sec_pad)}]
+        set ent_x [expr {$lx + $L(sec_value_dx)}]
+        set row 0
+        foreach {key label} {
+            popup_delay_ms "Popup delay (ms)"
+            popup_font_scale "Popup font scale"
+        } {
+            set ry [expr {$rows_y + $row * $L(entry_row_pitch)}]
+            set mid [expr {$ry + $L(entry_row_h) / 2}]
+            dui add dtext $page $lab_x $mid -tags ${key}_label -text [translate $label] \
+                -font $L(font_body) -width $L(sec_label_w) -fill "#444444" -anchor w -justify left
+            dui add entry $page $ent_x $mid -tags $key \
+                -textvariable ::plugins::GrindAdvisor::settings($key) \
+                -width 8 -font $L(font_body) -canvas_anchor w \
+                -borderwidth 1 -bg #fbfaff -foreground #4e85f4 -relief flat
+            incr row
         }
 
-        # Tools card: full content width, 2x2 grid of buttons inside.
-        set tools_y [expr {$L(sec_top) + $calc_h + $L(sec_gap)}]
+        # Tools card: full content width, 2x3 grid of buttons inside.
+        set tools_y [expr {$L(sec_top) + $ptun_h + $L(sec_gap)}]
         set rows_y [::plugins::GrindAdvisor::_sec_card $page sec_tools $lx $tools_y $L(content_w) $tools_h "Tools"]
         set inner_w [expr {$L(content_w) - 2 * $L(sec_pad)}]
         set half_w [expr {($inner_w - $L(lg)) / 2}]
         set bx0 [expr {$lx + $L(sec_pad)}]
         set bx1 [expr {$bx0 + $half_w + $L(lg)}]
         foreach {c r tag label target} [list \
-            0 0 history_display_options "History Display Options" GrindAdvisor_history_options \
-            1 0 diagnostics "Diagnostics" GrindAdvisor_diagnostics \
-            0 1 calculation_details "Calculation Details" GrindAdvisor_calculation_details \
-            1 1 help_guide "Help / Guide" GrindAdvisor_help] {
+            0 0 dose_yield_source "Dose / Yield Source" GrindAdvisor_dose_yield \
+            1 0 history_display_options "History Display Options" GrindAdvisor_history_options \
+            0 1 diagnostics "Diagnostics" GrindAdvisor_diagnostics \
+            1 1 calculation_details "Calculation Details" GrindAdvisor_calculation_details \
+            0 2 help_guide "Help / Guide" GrindAdvisor_help] {
             set bx [expr {$c == 0 ? $bx0 : $bx1}]
             set by [expr {$rows_y + $r * $L(row_pitch)}]
             dui add dbutton $page $bx $by [expr {$bx + $half_w}] [expr {$by + $L(btn_h)}] \
@@ -3009,15 +3243,15 @@ namespace eval ::dui::pages::GrindAdvisor_help {
             "Grind rounding increment controls how recommendations are rounded, such as 0.5 or 0.1." \
             "Grinder minimum and maximum keep recommendations inside your grinder scale." \
             "" \
-            "Higher grind number = coarser = faster shot." \
-            "Lower grind number = finer = slower shot." \
+            "Higher or lower grind numbers can mean coarser or finer depending on your grinder; the method learns your grinder's direction from your shots, so you never set it." \
             "" \
-            "Conservative: Small, safe changes. Best if you are near the right grind and want to avoid big jumps." \
-            "Normal: Moderate changes. Balanced mode." \
-            "Dynamic Barista: Recommended default. Uses shot error and same-bag calibration when available. Can make larger changes when the shot is clearly too fast or slow." \
-            "Aggressive New Bean: Bigger corrections for dialing in a new bean quickly. Useful when the first shots are very fast or very slow." \
+            "The method (one built-in Regression Forecast ladder, not selectable): with 1 shot of a bag it nudges the grind from the time error; with 2 shots it measures your bean's seconds-per-grind from the pair; with 3 or more it fits a line through every shot of the bag (weighing recent shots more) and solves it for the grind that lands on your target time. Accuracy grows as shots accumulate, and it resets when the bag changes." \
+            "Reason strings tell you which rung was used: 'First shot', '2-shot calibration', 'Regression over N shots' (with the learned slope and predicted time), or 'Regression fallback: <why>' when there isn't enough spread to fit a line yet." \
+            "Internal constants (fixed, not settings): default 3.0 s per grind step, 0.5 damping for the 1-2 shot rungs, 0.85 recency decay, 1.8 s/g dose sensitivity, 2.0 g outlier threshold, and 3 shots minimum before regression." \
             "" \
-            "Calibration Accuracy is a display-only confidence score from 0 to 100. It combines evidence (how many valid shots of the same bag or recipe feed the calibration; full credit at 5) with consistency (how close those recent shots landed to your target time; a 0s average error scores full, 10s or more scores zero), weighted 40/60. Fewer than 2 relevant shots shows Not enough data, and a new bag resets the score exactly like it resets calibration. More consistent shots on the same beans raise it; erratic times or a bean change lower it. It never changes the recommendation itself."] "\n"]
+            "Calibration Accuracy is a display-only confidence score from 0 to 100. It combines evidence (how many valid shots of the same bag or recipe feed the calibration; full credit at 5) with consistency (how close those recent shots landed to your target time; a 0s average error scores full, 10s or more scores zero), weighted 40/60. Fewer than 2 relevant shots shows Not enough data, and a new bag resets the score exactly like it resets calibration. More consistent shots on the same beans raise it; erratic times or a bean change lower it. It never changes the recommendation itself." \
+            "" \
+            "Dose / Yield Source (Advanced) chooses which dose and yield the plugin reports. Fixed uses your set dose and target yield. Actual uses the measured dose and final yield when present. Auto (default) uses measured values only when they pass plausibility (dose within Dose min/max, ratio within Ratio min/max), otherwise it falls back to the set values; a missing or zero measurement always falls back. The popup, reason line, and Diagnostics always state which source was used, e.g. 'dose: actual 18.4g' or 'dose: set 18.0g (actual 0.0g rejected)'. The grind recommendation is based on shot time only, so this choice never changes the recommended grind."] "\n"]
 
         set card_h [expr {$L(bar_y0) - $L(md) - $L(sec_top)}]
         set rows_y [::plugins::GrindAdvisor::_sec_card $page sec_help $lx $L(sec_top) $L(content_w) $card_h "Guide"]
@@ -3115,6 +3349,101 @@ namespace eval ::dui::pages::GrindAdvisor_calculation_details {
     }
 
     proc page_done {} {
+        ::plugins::GrindAdvisor::_exit_subpage
+    }
+}
+
+namespace eval ::dui::pages::GrindAdvisor_dose_yield {
+    # v2.3.0 sub-page (under Advanced). Mode selector + the four plausibility
+    # bounds, all numeric inputs kept in the top half of the screen.
+    variable data
+    array set data { mode_value {} }
+
+    proc setup {} {
+        set page [namespace tail [namespace current]]
+        upvar #0 ::plugins::GrindAdvisor::L L
+        set lx $L(left_x); set rx $L(right_x); set cx $L(center_x)
+
+        dui add dtext $page $cx $L(header_title_y) -tags page_title -text [translate "Dose / Yield Source"] \
+            -font $L(font_title) -width $L(content_w) -fill "#2b2b2b" -anchor center -justify center
+        dui add dtext $page $cx $L(header_subtitle_y) -tags subtitle \
+            -text [translate "Whether recommendations report set or measured dose and yield."] \
+            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor center -justify center
+
+        # One full-width card: mode selector row, then the 4 bounds in two
+        # columns (all entry centers land above y=800, the top half).
+        set card_h [expr {2 * $L(sec_pad) + $L(sec_title_h) + $L(md) + $L(btn_h) + $L(md) + 2 * $L(entry_row_pitch) - $L(md)}]
+        set rows_y [::plugins::GrindAdvisor::_sec_card $page sec_dy $lx $L(sec_top) $L(content_w) $card_h "Source Mode"]
+
+        set mid [expr {$rows_y + $L(btn_h) / 2}]
+        set btn_x1 [expr {$rx - $L(btn_w_std)}]
+        dui add dtext $page [expr {$lx + $L(sec_pad)}] $mid -tags mode_label -text [translate "Dose / yield mode"] \
+            -font $L(font_body) -width $L(sec_label_w) -fill "#444444" -anchor w -justify left
+        dui add dtext $page [expr {$lx + $L(sec_value_dx)}] $mid -tags mode_value -text "" \
+            -font $L(font_primary) -width [expr {$btn_x1 - $L(lg) - ($lx + $L(sec_value_dx))}] \
+            -fill "#4e85f4" -anchor w -justify left
+        dui add dbutton $page $btn_x1 $rows_y $rx [expr {$rows_y + $L(btn_h)}] \
+            -tags mode_btn -label [translate "Next"] \
+            -command ::dui::pages::GrindAdvisor_dose_yield::cycle_mode \
+            -label_font $L(font_button) -style ga_btn
+
+        set entries_top [expr {$rows_y + $L(btn_h) + $L(md)}]
+        foreach {c r key label} [list \
+            0 0 dose_min  "Dose min (g)" \
+            1 0 ratio_min "Ratio min" \
+            0 1 dose_max  "Dose max (g)" \
+            1 1 ratio_max "Ratio max"] {
+            if {$c == 0} {
+                set label_x [expr {$lx + $L(sec_pad)}]
+                set entry_x [expr {$lx + $L(sec_value_dx)}]
+            } else {
+                set label_x $L(col2_x)
+                set entry_x $L(col2_value_x)
+            }
+            set ry [expr {$entries_top + $r * $L(entry_row_pitch)}]
+            set emid [expr {$ry + $L(entry_row_h) / 2}]
+            dui add dtext $page $label_x $emid -tags ${key}_label -text [translate $label] \
+                -font $L(font_body) -width $L(sec_label_w) -fill "#444444" -anchor w -justify left
+            dui add entry $page $entry_x $emid -tags $key \
+                -textvariable ::plugins::GrindAdvisor::settings($key) \
+                -width 8 -font $L(font_body) -canvas_anchor w \
+                -borderwidth 1 -bg #fbfaff -foreground #4e85f4 -relief flat
+        }
+
+        set cap_y [expr {$L(sec_top) + $card_h + $L(sec_gap)}]
+        dui add dtext $page $lx $cap_y -tags dy_help -width $L(content_w) \
+            -font $L(font_caption) -fill "#666666" -anchor nw -justify left \
+            -text [translate "Fixed always uses your set dose and target yield. Actual uses the measured dose and final yield when present. Auto uses measured values only when the dose is within Dose min/max and the ratio (yield/dose) is within Ratio min/max, otherwise it falls back to the set values; a missing or zero measurement always falls back. Plausibility bounds apply to Auto only. This choice affects what the popup, reason line, and Diagnostics report; it does not change the grind recommendation itself."]
+
+        dui add dbutton $page $lx $L(bar_y0) [expr {$lx + $L(btn_w_std)}] $L(bar_y1) \
+            -tags page_done -label [translate "Done"] \
+            -command ::dui::pages::GrindAdvisor_dose_yield::page_done \
+            -label_font $L(font_button) -style ga_btn
+    }
+
+    proc show { page_to_hide page_to_show } {
+        ::plugins::GrindAdvisor::apply_defaults
+        refresh_values $page_to_show
+    }
+
+    proc refresh_values {page} {
+        variable data
+        set data(mode_value) [::plugins::GrindAdvisor::_dose_yield_mode_label $::plugins::GrindAdvisor::settings(dose_yield_mode)]
+        catch { dui item config $page mode_value -text $data(mode_value) }
+    }
+
+    proc cycle_mode {} {
+        set values {fixed actual auto}
+        set idx [lsearch -exact $values $::plugins::GrindAdvisor::settings(dose_yield_mode)]
+        if {$idx < 0} { set idx 2 }
+        set idx [expr {($idx + 1) % [llength $values]}]
+        set ::plugins::GrindAdvisor::settings(dose_yield_mode) [lindex $values $idx]
+        ::plugins::GrindAdvisor::save_settings
+        refresh_values GrindAdvisor_dose_yield
+    }
+
+    proc page_done {} {
+        ::plugins::GrindAdvisor::save_settings
         ::plugins::GrindAdvisor::_exit_subpage
     }
 }
