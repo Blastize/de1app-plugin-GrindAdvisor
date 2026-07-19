@@ -2,6 +2,17 @@
 
 All database and history-file access is strictly read-only in every version.
 
+## v2.2.0 — 2026-07-10
+
+- New: the Calculation Details page (under Advanced) now shows a trace of
+  your latest 5 shots, listing every value behind each recommendation —
+  shot time, target, error, dose, yield, bag shot number, seconds-per-grind-
+  step and where it came from (same-bag calibration, recipe match, or
+  default estimate), the adjustment cap, the raw grind before rounding, the
+  final recommendation, and the reason. Useful for understanding why a
+  recommendation came out the way it did. Display-only; the recommendation
+  math is unchanged.
+
 ## v2.1.1 — 2026-07-10
 
 - Fixed: shots deleted from the history folder (e.g. by a shot-editor
