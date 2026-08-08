@@ -323,6 +323,40 @@ namespace eval ::plugins::GrindAdvisor {
         present_result $last_recommendation
     }
 
+    # Public entry point: open the Calibration Curve directly, without going
+    # through the after-shot popup first. Skins that put a Curve control on
+    # their own grind tile call this (Lumen v0.17.0) rather than reaching into
+    # the overlay internals.
+    #
+    # Same source ladder as show_last_recommendation -- in-memory rec, then the
+    # saved one, then a fresh read-only analysis -- and _curve_rec fills in the
+    # bag's shots from SDB either way. _last_rec_shown is seeded so the curve's
+    # Back button lands on the normal popup.
+    proc show_calibration_curve {} {
+        variable last_recommendation
+        variable _last_rec_shown
+        variable popup_active
+
+        if {$last_recommendation eq ""} { load_last_recommendation }
+        set rec $last_recommendation
+        if {$rec eq "" || ![dict exists $rec ok] || ![dict get $rec ok]} {
+            set rec [analyze_latest_shot]
+        }
+        if {![dict exists $rec ok] || ![dict get $rec ok]} {
+            # Nothing to plot: show the normal error card rather than an empty
+            # pair of axes.
+            present_result $rec
+            return
+        }
+
+        set _last_rec_shown $rec
+        set popup_active 1
+        if {[_show_curve_dialog $rec]} { return }
+        set popup_active 0
+        catch { msg "GrindAdvisor: could not open the calibration curve" }
+        catch { borg toast "Grind Advisor: could not open the calibration curve" }
+    }
+
     proc show_latest_recommendation {} {
         variable last_shown_id
         variable last_recommendation
@@ -1489,6 +1523,7 @@ namespace eval ::plugins::GrindAdvisor {
             grind $grind actual $actual target $target next $next \
             error [expr {$target - $actual}] \
             reason [_forecast_reason $fc $next] \
+            shots $shots \
             method [dict get $fc method] \
             m [dict get $fc m] b [dict get $fc b] r2 [dict get $fc r2] r2raw $r2raw \
             n [dict get $fc n] normalized [dict get $fc normalized] \
@@ -2143,9 +2178,11 @@ namespace eval ::plugins::GrindAdvisor {
                     _otext $o $lab_x [expr {$y + $fcap / 2}] w [_fit_text $conf_line $fcap $inner] $fcap [dict get $col muted] $inner left
                 }
 
-                # Button row: OK / Why? / History, identical size, evenly spaced.
-                set bgap [_clamp [expr {int($cw * 0.05)}] 24 56]
-                set btnw [expr {int(($cw - 2 * $pad - 2 * $bgap) / 3)}]
+                # Button row: OK / Why? / Curve / History, identical size,
+                # evenly spaced. Four buttons now, so the gap is tightened --
+                # at 4 x the old 5%-of-card gap the labels would not fit.
+                set bgap [_clamp [expr {int($cw * 0.03)}] 14 36]
+                set btnw [expr {int(($cw - 2 * $pad - 3 * $bgap) / 4)}]
                 set bty2 [expr {$y1 - $pad}]
                 set bty1 [expr {$bty2 - $btnh}]
                 set bx0 [expr {$x0 + $pad}]
@@ -2154,6 +2191,9 @@ namespace eval ::plugins::GrindAdvisor {
                 set bx0 [expr {$bx0 + $btnw + $bgap}]
                 _obutton $o $bx0 $bty1 [expr {$bx0 + $btnw}] $bty2 "Why?" $fbtn \
                     [list ::plugins::GrindAdvisor::_why_and_stay]
+                set bx0 [expr {$bx0 + $btnw + $bgap}]
+                _obutton $o $bx0 $bty1 [expr {$bx0 + $btnw}] $bty2 "Curve" $fbtn \
+                    [list ::plugins::GrindAdvisor::_curve_and_stay]
                 set bx0 [expr {$bx0 + $btnw + $bgap}]
                 _obutton $o $bx0 $bty1 [expr {$bx0 + $btnw}] $bty2 "History" $fbtn \
                     [list ::plugins::GrindAdvisor::_history_and_close]
@@ -2219,6 +2259,519 @@ namespace eval ::plugins::GrindAdvisor {
         } else {
             _close_dialog
         }
+    }
+
+    # ------------------------------------------------------------------
+    #  v3.1.0 calibration curve.
+    #
+    #  A calibration curve is only honest if it shows the scatter and the
+    #  residuals, not just a correlation number: a very high R2 can sit on top
+    #  of a real bias, and a line drawn through two points always has R2 = 1
+    #  while saying nothing about accuracy. So this view draws the shots, the
+    #  line the model actually solved, the residuals about that line, and a
+    #  caption reporting bias and spread alongside R2.
+    #
+    #  Everything comes from the rec dict already computed and shown. No SDB
+    #  read, no re-analysis, no writes -- same rule as the Why? explainer.
+    # ------------------------------------------------------------------
+
+    # The plotted y series MUST be the series the model fitted, or the drawn
+    # residuals and the reported R2 would describe different things:
+    # _weighted_regression is always called with ynorm=1, so `regression`
+    # works in t_norm; every other rung comes from _ladder_small, which works
+    # in RAW time. For those rungs there is no fitted line, so we draw the one
+    # the ladder implies: through the latest shot with slope -s_per_step,
+    # because it solves next = grind + (t - target)/s_per_step.
+    # Guarantee a rec that carries the bag's shots.
+    #
+    # A recommendation saved by an older version has no `shots` key -- but the
+    # shots themselves are sitting in SDB regardless, and the plugin already
+    # knows how to read them. So re-run the same read-only analysis the popup
+    # itself uses, rather than asking for a shot that has already been pulled.
+    #
+    # The whole rec is replaced, not just its shots: captioning a stale R2 and
+    # n against freshly gathered points would describe two different fits.
+    proc _curve_rec {rec} {
+        if {[_dget $rec shots] ne ""} { return $rec }
+        if {[catch { set fresh [analyze_latest_shot] } err]} {
+            catch { msg "GrindAdvisor: curve could not re-read SDB: $err" }
+            return $rec
+        }
+        if {![dict exists $fresh ok] || ![dict get $fresh ok]} { return $rec }
+        if {[_dget $fresh shots] eq ""} { return $rec }
+        return $fresh
+    }
+
+    proc _curve_model {rec} {
+        set shots [_dget $rec shots]
+        if {$shots eq "" || [catch { llength $shots }] || [llength $shots] == 0} {
+            return [dict create ok 0 why "No shots for this bag could be read from SDB. Check that SDB is enabled and has espresso shots recorded."]
+        }
+
+        set method [_dget $rec method]
+        set use_norm [expr {$method eq "regression"}]
+
+        set pts {}
+        foreach s $shots {
+            if {[catch {
+                set x [_to_float [dict get $s grind]]
+                if {$use_norm} {
+                    set y [_to_float [dict get $s t_norm]]
+                } else {
+                    set y [_to_float [dict get $s t_raw]]
+                }
+            }]} { continue }
+            if {$x eq "" || $y eq ""} { continue }
+            lappend pts [list $x $y]
+        }
+        if {[llength $pts] == 0} {
+            return [dict create ok 0 why "No usable grind/time pairs in this recommendation."]
+        }
+
+        # The line. shots is newest-first, so index 0 is the latest shot.
+        set m [_to_float [_dget $rec m]]
+        set b [_to_float [_dget $rec b]]
+        if {$m eq "" || $b eq ""} {
+            set sps [_to_float [_dget $rec s_per_step]]
+            if {$sps eq "" || $sps == 0} {
+                set m ""
+                set b ""
+            } else {
+                lassign [lindex $pts 0] lx ly
+                set m [expr {-1.0 * $sps}]
+                set b [expr {$ly - $m * $lx}]
+            }
+        }
+
+        # Residuals about that line, and the accuracy the correlation hides.
+        #
+        # The residuals themselves are always drawable, but bias and spread are
+        # only reported at n>=3. Below that the line is pinned to the latest
+        # shot by construction (_ladder_small solves through it), so those two
+        # numbers describe the construction, not the calibration -- at n=1 they
+        # are identically zero and at n=2 they just restate the pair. Printing
+        # them beside a verdict that says there is no fit quality yet would
+        # contradict it.
+        set resid {}
+        set bias ""
+        set rmse ""
+        set maxabs ""
+        if {$m ne "" && $b ne ""} {
+            set sum 0.0
+            set sumsq 0.0
+            set mx 0.0
+            foreach p $pts {
+                lassign $p x y
+                set r [expr {$y - ($m * $x + $b)}]
+                lappend resid $r
+                set sum   [expr {$sum + $r}]
+                set sumsq [expr {$sumsq + $r * $r}]
+                if {abs($r) > $mx} { set mx [expr {abs($r)}] }
+            }
+            set k [llength $resid]
+            if {$k >= 3} {
+                set bias   [expr {$sum / double($k)}]
+                set rmse   [expr {sqrt($sumsq / double($k))}]
+                set maxabs $mx
+            }
+        }
+
+        return [dict create ok 1 pts $pts resid $resid m $m b $b \
+            normalized $use_norm bias $bias rmse $rmse maxabs $maxabs]
+    }
+
+    # Caption under the plot: the point of the whole view. R2 alone is not
+    # accuracy, so bias and spread are shown beside it, and a fit that scores
+    # well while missing badly is called out rather than left to look good.
+    proc _curve_caption {rec cm} {
+        set parts {}
+        set r2 [_dget $rec r2]
+        if {$r2 eq ""} {
+            lappend parts "R² n/a"
+        } else {
+            lappend parts "R² [format %.3f $r2]"
+        }
+        if {[dict get $cm bias] ne ""} {
+            lappend parts "bias [format %+.2f [dict get $cm bias]]s"
+            lappend parts "spread ±[format %.2f [dict get $cm rmse]]s"
+        }
+        set n [_dget $rec n]
+        if {$n ne ""} { lappend parts "n=$n" }
+        return [join $parts "   ·   "]
+    }
+
+    proc _curve_verdict {rec cm} {
+        set npts [llength [dict get $cm pts]]
+        if {$npts < 3} {
+            return "Fewer than 3 shots on this bag: a line through them fits perfectly by definition, so there is no fit quality to judge yet."
+        }
+        set r2 [_dget $rec r2]
+        set rmse [dict get $cm rmse]
+        if {$r2 ne "" && $rmse ne "" && $r2 >= 0.97 && $rmse > 1.0} {
+            return "High R² but the residuals are large: the trend is right, the individual predictions are not. Treat the next number as a nudge, not a target."
+        }
+        if {$rmse ne "" && $rmse > 2.0} {
+            return "Residuals are scattered widely, so shot time is being driven by something other than grind alone. Check dose and distribution before chasing the grind."
+        }
+        if {[dict get $cm bias] ne "" && abs([dict get $cm bias]) > 0.75} {
+            return "The line sits off-centre through the points, so the model is consistently over- or under-shooting across the range."
+        }
+        if {$rmse ne "" && $rmse <= 1.0} {
+            return "Residuals are small and evenly spread about the line: this calibration is behaving."
+        }
+        return "Residuals are moderate. More shots on this bag will tighten the fit."
+    }
+
+    # A "nice" tick step (1, 2 or 5 x a power of ten) giving roughly $target
+    # intervals across $span, so grind ticks land on readable values like 8.5
+    # or 13.0 instead of 8.437.
+    proc _nice_step {span target} {
+        if {$span <= 0 || $target <= 0} { return 1.0 }
+        set raw [expr {double($span) / double($target)}]
+        if {$raw <= 0} { return 1.0 }
+        set mag [expr {pow(10, floor(log10($raw)))}]
+        set n [expr {$raw / $mag}]
+        # Round to the NEAREST nice value (breakpoints at the geometric
+        # midpoints 1.5 / 3 / 7), not up to the next one. Rounding up halves
+        # the tick count: a 3.0-wide grind range wants 0.5 steps -- 8.0, 8.5,
+        # 9.0 ... which is how grinders are marked anyway -- but rounding up
+        # turns that into whole numbers and three lonely ticks.
+        if {$n < 1.5} {
+            set s 1.0
+        } elseif {$n < 3.0} {
+            set s 2.0
+        } elseif {$n < 7.0} {
+            set s 5.0
+        } else {
+            set s 10.0
+        }
+        return [expr {$s * $mag}]
+    }
+
+    proc _curve_and_stay {} {
+        variable _last_rec_shown
+        if {$_last_rec_shown eq "" || ![dict exists $_last_rec_shown ok] || \
+            ![dict get $_last_rec_shown ok]} { return }
+        _show_curve_dialog $_last_rec_shown
+    }
+
+    proc _show_curve_dialog {rec} {
+        lassign [_pgeom] parent W H o
+        if {[catch {
+            catch { destroy $o }
+            set col [_colors]
+            set F [_pfonts $H]
+            set fsec  [dict get $F section]
+            set fbody [dict get $F body]
+            set fcap  [dict get $F caption]
+            set fbtn  [dict get $F button]
+
+            canvas $o -bg [dict get $col scrim] -highlightthickness 0 -bd 0 \
+                -takefocus 0
+            place $o -in $parent -x 0 -y 0 -relwidth 1 -relheight 1
+            raise $o
+
+            # Wider than the other cards: a plot needs the horizontal room.
+            set cw [expr {int($W * 0.78)}]
+            if {$cw > ($W - 80)} { set cw [expr {$W - 80}] }
+            if {$cw < 320} { set cw [expr {$W - 24}] }
+            set pad    [_clamp [expr {int($H * 0.045)}] 24 48]
+            set inner  [expr {$cw - 2 * $pad}]
+            set gap_sm [_clamp [expr {int($H * 0.012)}] 8 14]
+            set gap_lg [_clamp [expr {int($H * 0.025)}] 14 26]
+            set btnh   [_clamp [expr {int($H * 0.085)}] 54 70]
+            set radius [_clamp [expr {int($H * 0.02)}] 10 20]
+
+            # Fill in the bag's shots from SDB when the stored rec predates
+            # them, so the curve works on the shots already pulled.
+            set rec [_curve_rec $rec]
+            set cm [_curve_model $rec]
+
+            # Plot geometry: main panel plus a short residual strip beneath it,
+            # sharing one x axis so a point and its residual line up visually.
+            set axis_w [expr {int($fcap * 3.2)}]
+            set main_h [_clamp [expr {int($H * 0.30)}] 150 300]
+            set res_h  [_clamp [expr {int($H * 0.11)}] 60 120]
+            set caption_h [expr {$fcap + $gap_sm}]
+            set cap_lineh [expr {int($fcap * 135 / 100)}]
+
+            if {[dict get $cm ok]} {
+                # Measure the verdict rather than assuming two lines: it wraps
+                # to three on a narrow card, and a fixed guess would push the
+                # text into the button row.
+                set vlines [_text_lines [_curve_verdict $rec $cm] $fcap $inner]
+                if {$vlines > 3} { set vlines 3 }
+                set verdict_h [expr {$vlines * $cap_lineh}]
+                # main plot | y-label row | residual strip | tick + grind
+                # numbers | axis caption row | caption | verdict
+                set tickh [_clamp [expr {int($fcap * 0.35)}] 3 7]
+                set body_h [expr {$main_h + $gap_sm + $fcap + $gap_sm + $res_h \
+                    + $tickh + 2 + $fcap + $gap_sm + $fcap \
+                    + $gap_lg + $caption_h + $verdict_h}]
+            } else {
+                # No plot to draw: a compact message card, not a tall empty one.
+                set wlines [_text_lines [dict get $cm why] [dict get $F body] $inner]
+                if {$wlines > 6} { set wlines 6 }
+                set body_h [expr {$wlines * int([dict get $F body] * 135 / 100)}]
+            }
+
+            set ch [expr {$pad + $fsec + $gap_lg + $body_h + $gap_lg + $btnh + $pad}]
+            if {$ch > ($H - 24)} { set ch [expr {$H - 24}] }
+
+            set x0 [expr {int(($W - $cw) / 2)}]
+            set y0 [expr {int(($H - $ch) / 2)}]
+            set x1 [expr {$x0 + $cw}]
+            set y1 [expr {$y0 + $ch}]
+            set cx [expr {int(($x0 + $x1) / 2)}]
+
+            _opoly $o $x0 $y0 $x1 $y1 $radius [dict get $col panel] [dict get $col border] gad
+
+            set y [expr {$y0 + $pad}]
+            _otext $o $cx [expr {$y + $fsec / 2}] center "Calibration Curve" $fsec [dict get $col text] $inner center bold
+            incr y [expr {$fsec + $gap_lg}]
+
+            if {![dict get $cm ok]} {
+                _otext $o [expr {$x0 + $pad}] $y nw [dict get $cm why] $fbody [dict get $col text] $inner left
+            } else {
+                set plot_x0 [expr {$x0 + $pad + $axis_w}]
+                set plot_x1 [expr {$x1 - $pad}]
+                _draw_curve_panels $o $rec $cm $plot_x0 $y $plot_x1 \
+                    $main_h $res_h $fcap $gap_sm $col
+                # Must match the body_h budget above, term for term.
+                incr y [expr {$main_h + $gap_sm + $fcap + $gap_sm + $res_h \
+                    + $tickh + 2 + $fcap + $gap_sm + $fcap + $gap_lg}]
+
+                _otext $o $cx [expr {$y + $fcap / 2}] center [_curve_caption $rec $cm] \
+                    $fcap [dict get $col accent] $inner center bold
+                incr y [expr {$fcap + $gap_sm}]
+                _otext $o [expr {$x0 + $pad}] $y nw [_curve_verdict $rec $cm] \
+                    $fcap [dict get $col muted] $inner left
+            }
+
+            set bgap [_clamp [expr {int($cw * 0.05)}] 24 56]
+            set btnw [expr {int(($cw - 2 * $pad - $bgap) / 2)}]
+            set bty2 [expr {$y1 - $pad}]
+            set bty1 [expr {$bty2 - $btnh}]
+            set bx0 [expr {$x0 + $pad}]
+            _obutton $o $bx0 $bty1 [expr {$bx0 + $btnw}] $bty2 "Back" $fbtn \
+                [list ::plugins::GrindAdvisor::_reshow_popup]
+            set bx0 [expr {$bx0 + $btnw + $bgap}]
+            _obutton $o $bx0 $bty1 [expr {$bx0 + $btnw}] $bty2 "OK" $fbtn \
+                [list ::plugins::GrindAdvisor::_close_dialog]
+
+            after 200  [list catch [list raise $o]]
+            after 600  [list catch [list raise $o]]
+        } err]} {
+            catch { destroy $o }
+            catch { msg "GrindAdvisor: curve dialog failed: $err" }
+            return 0
+        }
+        return 1
+    }
+
+    # Scatter + fitted line above, residuals about that line below, on one
+    # shared x scale. Drawn with plain canvas primitives (no BLT) because this
+    # overlay is a raw Tk canvas in physical pixels, like the rest of the popup.
+    proc _draw_curve_panels {o rec cm px0 py0 px1 main_h res_h fcap gap col} {
+        set pts   [dict get $cm pts]
+        set resid [dict get $cm resid]
+        set m     [dict get $cm m]
+        set b     [dict get $cm b]
+
+        # x range over the shots, widened to include the recommended grind so
+        # the marker for it is always on the plot.
+        set xs {}
+        set ys {}
+        foreach p $pts { lassign $p x yy; lappend xs $x; lappend ys $yy }
+        set xmin [::tcl::mathfunc::min {*}$xs]
+        set xmax [::tcl::mathfunc::max {*}$xs]
+        set nextg [_to_float [_dget $rec next]]
+        if {$nextg ne ""} {
+            if {$nextg < $xmin} { set xmin $nextg }
+            if {$nextg > $xmax} { set xmax $nextg }
+        }
+        if {$xmax - $xmin < 1e-6} {
+            set xmin [expr {$xmin - 0.5}]
+            set xmax [expr {$xmax + 0.5}]
+        }
+        set xpadv [expr {($xmax - $xmin) * 0.10}]
+        set xmin [expr {$xmin - $xpadv}]
+        set xmax [expr {$xmax + $xpadv}]
+
+        # y range over the shots and the target line.
+        set ymin [::tcl::mathfunc::min {*}$ys]
+        set ymax [::tcl::mathfunc::max {*}$ys]
+        set tgt [_to_float [_dget $rec target]]
+        if {$tgt ne ""} {
+            if {$tgt < $ymin} { set ymin $tgt }
+            if {$tgt > $ymax} { set ymax $tgt }
+        }
+        if {$ymax - $ymin < 1e-6} {
+            set ymin [expr {$ymin - 1.0}]
+            set ymax [expr {$ymax + 1.0}]
+        }
+        set ypadv [expr {($ymax - $ymin) * 0.12}]
+        set ymin [expr {$ymin - $ypadv}]
+        set ymax [expr {$ymax + $ypadv}]
+
+        set py1 [expr {$py0 + $main_h}]
+        set sx [expr {double($px1 - $px0) / double($xmax - $xmin)}]
+        set sy [expr {double($main_h) / double($ymax - $ymin)}]
+
+        # Residual strip geometry is needed up here because the grind
+        # gridlines run through both panels, and the grid has to be drawn
+        # before the data or Tk stacks it on top of the points.
+        set ry0 [expr {$py1 + $gap + $fcap + $gap}]
+        set ry1 [expr {$ry0 + $res_h}]
+        set rmid [expr {($ry0 + $ry1) / 2}]
+        set tickh [_clamp [expr {int($fcap * 0.35)}] 3 7]
+
+        # Axes, both panels.
+        $o create line $px0 $py0 $px0 $py1 -fill [dict get $col muted] -width 1 -tags gad
+        $o create line $px0 $py1 $px1 $py1 -fill [dict get $col muted] -width 1 -tags gad
+        $o create line $px0 $ry0 $px0 $ry1 -fill [dict get $col muted] -width 1 -tags gad
+        $o create line $px0 $rmid $px1 $rmid -fill [dict get $col muted] -width 1 -tags gad
+
+        # ---- shared grind axis ----
+        #
+        # Ticks carry the grind numbers, and each runs a faint gridline through
+        # BOTH panels, so a point (or its residual) can be traced straight down
+        # to the grind that produced it. That is the whole reason the panels
+        # share an x scale. Drawn here, before the data, so it sits underneath.
+        set step [_nice_step [expr {$xmax - $xmin}] 5]
+        set t [expr {ceil($xmin / $step) * $step}]
+        while {$t <= $xmax + 1e-9} {
+            set tx [expr {$px0 + ($t - $xmin) * $sx}]
+            if {$tx >= $px0 - 1 && $tx <= $px1 + 1} {
+                $o create line $tx $py0 $tx $py1 -fill [dict get $col border] \
+                    -width 1 -dash {1 6} -tags gad
+                $o create line $tx $ry0 $tx $ry1 -fill [dict get $col border] \
+                    -width 1 -dash {1 6} -tags gad
+                $o create line $tx $py1 $tx [expr {$py1 + $tickh}] \
+                    -fill [dict get $col muted] -width 1 -tags gad
+                $o create line $tx $ry1 $tx [expr {$ry1 + $tickh}] \
+                    -fill [dict get $col muted] -width 1 -tags gad
+                _otext $o $tx [expr {$ry1 + $tickh + 2}] n [_fmt_num $t] \
+                    $fcap [dict get $col muted] 0 center
+            }
+            set t [expr {$t + $step}]
+        }
+
+        # Target-time guide: the horizontal the model is solving for.
+        if {$tgt ne ""} {
+            set ty [expr {$py1 - ($tgt - $ymin) * $sy}]
+            $o create line $px0 $ty $px1 $ty -fill [dict get $col muted] \
+                -width 1 -dash {3 4} -tags gad
+            _otext $o [expr {$px1 - 4}] [expr {$ty - $fcap}] se \
+                "target [_fmt_num $tgt]s" $fcap [dict get $col muted] 0 right
+        }
+
+        # The fitted line, evaluated at the plot edges and clipped to the box.
+        if {$m ne "" && $b ne ""} {
+            set lx0 $xmin
+            set lx1 $xmax
+            set ly0 [expr {$m * $lx0 + $b}]
+            set ly1 [expr {$m * $lx1 + $b}]
+            # Clip to [ymin,ymax] by solving for x where the line leaves the box.
+            foreach {edge} {0 1} {
+                if {$edge == 0} { set ly $ly0 } else { set ly $ly1 }
+                if {$ly < $ymin || $ly > $ymax} {
+                    set bound [expr {$ly < $ymin ? $ymin : $ymax}]
+                    if {abs($m) > 1e-9} {
+                        set nx [expr {($bound - $b) / double($m)}]
+                        if {$nx >= $xmin && $nx <= $xmax} {
+                            if {$edge == 0} {
+                                set lx0 $nx; set ly0 $bound
+                            } else {
+                                set lx1 $nx; set ly1 $bound
+                            }
+                        }
+                    }
+                }
+            }
+            $o create line \
+                [expr {$px0 + ($lx0 - $xmin) * $sx}] [expr {$py1 - ($ly0 - $ymin) * $sy}] \
+                [expr {$px0 + ($lx1 - $xmin) * $sx}] [expr {$py1 - ($ly1 - $ymin) * $sy}] \
+                -fill [dict get $col accent] -width 2 -tags gad
+        }
+
+        # The recommended grind, as a labelled vertical. On the regression rung
+        # this is exactly where the fitted line crosses the target time (then
+        # rounded to the grinder's increment), so the crossing of the two
+        # dashed guides IS the answer the popup gives -- label it as such
+        # rather than leaving the user to read it off the axis.
+        if {$nextg ne ""} {
+            set nx [expr {$px0 + ($nextg - $xmin) * $sx}]
+            $o create line $nx $py0 $nx $py1 -fill [dict get $col accent] \
+                -width 1 -dash {2 5} -tags gad
+            # Label inside the plot, flipped to the other side of the line when
+            # the marker sits near the right edge so it cannot run off the card.
+            set ntxt "grind [_fmt_num $nextg]"
+            if {$nx > ($px0 + $px1) / 2} {
+                _otext $o [expr {$nx - 5}] [expr {$py0 + 2}] ne $ntxt $fcap [dict get $col accent] 0 right
+            } else {
+                _otext $o [expr {$nx + 5}] [expr {$py0 + 2}] nw $ntxt $fcap [dict get $col accent] 0 left
+            }
+        }
+
+        # Shot points. Newest first, so index 0 is the latest shot: draw it
+        # filled and larger so "where am I now" is readable at a glance.
+        set r [_clamp [expr {int($fcap * 0.34)}] 3 7]
+        set i 0
+        foreach p $pts {
+            lassign $p x yy
+            set cxp [expr {$px0 + ($x - $xmin) * $sx}]
+            set cyp [expr {$py1 - ($yy - $ymin) * $sy}]
+            if {$i == 0} {
+                set rr [expr {$r + 2}]
+                $o create oval [expr {$cxp - $rr}] [expr {$cyp - $rr}] \
+                    [expr {$cxp + $rr}] [expr {$cyp + $rr}] \
+                    -fill [dict get $col accent] -outline [dict get $col panel] \
+                    -width 2 -tags gad
+            } else {
+                $o create oval [expr {$cxp - $r}] [expr {$cyp - $r}] \
+                    [expr {$cxp + $r}] [expr {$cyp + $r}] \
+                    -fill [dict get $col text] -outline "" -tags gad
+            }
+            incr i
+        }
+
+        # y axis end labels, and the axis caption naming the series actually
+        # fitted -- normalized time is not the same thing as shot time.
+        _otext $o [expr {$px0 - 6}] $py0 ne [format %.0f $ymax] $fcap [dict get $col muted] 0 right
+        _otext $o [expr {$px0 - 6}] $py1 se [format %.0f $ymin] $fcap [dict get $col muted] 0 right
+        set ylab [expr {[dict get $cm normalized] ? "time (normalized), s" : "shot time, s"}]
+        _otext $o $px0 [expr {$py1 + $gap}] nw $ylab $fcap [dict get $col muted] 0 left
+
+        # ---- residual strip data, same x scale (axes and grid already drawn) ----
+        _otext $o [expr {$px0 - 6}] $rmid e "0" $fcap [dict get $col muted] 0 right
+
+        if {[llength $resid] > 0} {
+            set rmax 0.0
+            foreach rv $resid { if {abs($rv) > $rmax} { set rmax [expr {abs($rv)}] } }
+            if {$rmax < 1e-6} { set rmax 1.0 }
+            set rsy [expr {double($res_h) / 2.0 / ($rmax * 1.15)}]
+            set i 0
+            foreach p $pts rv $resid {
+                lassign $p x yy
+                set cxp [expr {$px0 + ($x - $xmin) * $sx}]
+                set cyp [expr {$rmid - $rv * $rsy}]
+                # Stem to zero: makes a one-sided (biased) pattern obvious.
+                $o create line $cxp $rmid $cxp $cyp -fill [dict get $col muted] \
+                    -width 1 -tags gad
+                set fillc [expr {$i == 0 ? [dict get $col accent] : [dict get $col text]}]
+                $o create oval [expr {$cxp - $r}] [expr {$cyp - $r}] \
+                    [expr {$cxp + $r}] [expr {$cyp + $r}] \
+                    -fill $fillc -outline "" -tags gad
+                incr i
+            }
+            _otext $o [expr {$px0 - 6}] $ry0 ne "+[format %.1f $rmax]" $fcap [dict get $col muted] 0 right
+        }
+
+        _otext $o $px0 [expr {$ry1 + $tickh + 2 + $fcap + $gap}] nw \
+            "residuals, s" $fcap [dict get $col muted] 0 left
+        _otext $o $px1 [expr {$ry1 + $tickh + 2 + $fcap + $gap}] ne \
+            "grind setting →" $fcap [dict get $col muted] 0 right
     }
 
     proc _show_why_dialog {rec} {
