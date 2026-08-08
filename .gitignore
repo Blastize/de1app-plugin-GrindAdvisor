@@ -3,8 +3,29 @@
 settings.tdb
 last_recommendation.tdb
 last_state.tdb
+*.tdb
+
+# Espresso databases and shot history -- personal data, never public.
+*.db
+*.sqlite
+*.sqlite3
+history/
+history_v2/
+history_archive/
+*.shot
 
 # Local backup/trash/log folders (never shipped)
 backups/
 trash/
 logs/
+*.bak
+trash_manifest.txt
+delete_log.txt
+
+# Version archives
+*Archive/
+
+# OS junk
+desktop.ini
+Thumbs.db
+.DS_Store

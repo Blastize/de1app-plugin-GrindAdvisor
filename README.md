@@ -1,6 +1,6 @@
-# Grind Advisor v3.0.0
+# Grind Advisor v3.3.0
 
-Current plugin version: **v3.0.0**.
+Current plugin version: **v3.3.0**.
 
 A DE1app (Decent Espresso) plugin. After every completed espresso shot it
 reads your latest shot from **SDB** and shows a popup recommending your next
@@ -24,12 +24,81 @@ grind setting. You enter nothing by hand.
 │   -4.1 s/grind, predicts 28.0s    │
 │   at 13.0).                       │
 │                                   │
-│  [ OK ]   [ Why? ]   [ History ]  │
+│ [ OK ] [ Why? ] [ Curve ] [ Hist ]│
 └───────────────────────────────────┘
 ```
 
 Dose, Yield, and Ratio lines appear automatically when those columns exist in
 SDB; if they aren't stored, those lines are simply omitted.
+
+## Calibration Curve
+
+**Curve** shows what the recommendation is actually standing on. **Back**
+returns to the popup.
+
+```
+┌─────────────────────────────────────────┐
+│           Calibration Curve             │
+│  30 ┃  ·                                │
+│     ┃╲   ·        ┆      target 28s     │
+│  ‥‥‥┃‥‥╲‥‥‥‥‥‥‥‥‥‥┆‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥ │
+│     ┃    ╲ ·   ·  ┆                     │
+│  22 ┗━┿━━━━┿━━━━┿━━━━┿━━━━┿━━━━┿━━━━━━  │
+│     time (normalized), s                │
+│ +1.2┃ ┆    ┆  │ ┆    ┆ │  ┆             │
+│   0 ┠─┼────┼──┬─┼────┼─┴──┼─────────    │
+│     ┃ ┆    ┆  │ ┆    ┆    ┆             │
+│       8   8.5  9   9.5  10   10.5       │
+│     residuals, s        grind setting → │
+│                                         │
+│  R² 0.996  ·  bias +0.01s  ·  spread    │
+│  ±0.09s  ·  n=6                         │
+│  Residuals are small and evenly spread  │
+│  about the line: this calibration is    │
+│  behaving.                              │
+│                                         │
+│      [ Back ]           [ OK ]          │
+└─────────────────────────────────────────┘
+```
+
+* **Top panel** — every eligible shot on the current bag, the line the model
+  solved, a dashed guide at your target time, and a labelled dashed vertical
+  at the recommended grind. On the regression rung those two dashed guides
+  cross exactly where the fitted line hits your target time — that crossing
+  *is* the recommendation. The latest shot is the larger accent dot.
+* **Residual strip** — how far each shot sits from that line. Stems to zero,
+  so residuals stacked on one side (a biased fit) are obvious.
+* **Grind axis** — ticks at readable grind values (0.5 steps on a typical
+  range, 0.1 on a tight one), each running a faint gridline through *both*
+  panels, so any point or residual traces straight down to the grind that
+  produced it.
+* **Caption** — `R² · bias · spread · n`, then a plain-language verdict.
+
+**Opening it:** the **Curve** button on the after-shot popup, or — in skins
+that support it, such as Lumen — the **Curve** control on the grind tile,
+which goes straight there without the popup. Back returns to the popup either
+way.
+
+**Why bias and spread, and not just R²?** R² is correlation, not accuracy. A
+line can follow the trend closely and still sit consistently off the points,
+and through two points it is 1.000 by construction while telling you nothing.
+So a high R² with large residuals is called out rather than left to look like
+a good result.
+
+**Under 3 shots on a bag, bias and spread are not shown.** The line is solved
+*through* the latest shot at that point, so those numbers would describe the
+arithmetic rather than your calibration. The view says so instead of printing
+a reassuring zero.
+
+The y axis reads *time (normalized)* when the regression is running — that is
+the series it actually fits, with dose and yield differences divided out — and
+*shot time* on the 1- and 2-shot rungs, which work in raw time.
+
+**You do not need to pull a shot first.** If the stored recommendation has no
+shot data attached (anything saved before v3.1.0), Curve re-reads the current
+bag from SDB using the same read-only query the popup itself uses, and plots
+the shots you have already pulled. It only reports a problem if SDB genuinely
+has no espresso shots for this bag.
 
 ## Install
 
