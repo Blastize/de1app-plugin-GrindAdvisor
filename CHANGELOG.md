@@ -1,5 +1,50 @@
 # Grind Advisor — Changelog
 
+## v3.4.0 (Bag Stats page: per-bag R² and average)
+
+Safety status: **no write behavior exists in this version.** The new page is
+read-only and display-only: it reuses the existing read-only SDB fetch path
+(`locate_shot_source` + `_fetch_recent`, SELECTs only, one larger 600-row
+window) and nothing on it feeds back into any recommendation. Still the one
+written file, `last_recommendation.tdb`.
+
+### New: Advanced → Tools → Bag Stats
+
+The R² shown on the popup, Curve, and Calculation Details is **per bag** — it
+is the fit of the current bag's own time-vs-grind regression and resets when
+the bag changes. Until now there was nowhere to see it across bags. The new
+page lists the latest 8 bags (newest first), each with:
+
+* the bag label (bean · roaster) and its first–last shot dates,
+* **R²** and the learned **slope** (s/grind) from the exact same
+  recency-weighted regression the forecast uses (normalized time, outliers
+  excluded), computed over the whole bag,
+* eligible shot count and how many outliers were excluded,
+* bags with fewer than 3 eligible shots or no grind spread show "R² n/a"
+  with the reason instead of a number.
+
+A summary block on top shows the **average R² across all fitted bags** and
+the **median bean slope** of good fits (R² ≥ 0.5) — the slope, not R², is the
+number that could seed a new bag's first recommendations in a future pass
+(analysis 2026-08-08: the n=1/n=2 rungs assume 3.0 s/step with 0.5 damping,
+an effective 6.0 s/step; measured bean slopes ran 2.5–4.9 s/grind, which is
+why first-shot corrections under-step and bags take ~3 shots to reach
+target). This version only displays the statistics; the recommendation
+engine is untouched.
+
+### Implementation notes
+
+* New `_bag_stats_text` (text builder) + `_bag_date_short`, new
+  `GrindAdvisor_bag_stats` fpdialog page copied from the Diagnostics page
+  pattern (full-width section card, caption font, Done → `_exit_subpage`),
+  registered in `preload_settings_page`, launched from the free (row 2,
+  col 2) slot of the Advanced Tools card — no geometry changes.
+* Verified offline: whole file parses in tclsh, all new procs byte-compile,
+  and the page text was exercised against the real tablet `shots.db`
+  (600-row window, 9 bags) with per-bag R² values cross-checked against an
+  independent Python replication of the engine (0.94 / 0.42 / 0.12 for the
+  three most recent bags — exact match).
+
 ## v3.3.0 (grind axis labelled; Curve openable from a skin tile) — TABLET-VERIFIED 2026-08-02
 
 Safety status: **no write behavior is added in this version.** Read-only SDB
