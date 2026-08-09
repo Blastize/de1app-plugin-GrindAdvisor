@@ -306,7 +306,6 @@ namespace eval ::plugins::GrindAdvisor {
         dui page add GrindAdvisor_diagnostics -namespace true -theme default -type fpdialog
         dui page add GrindAdvisor_calculation_details -namespace true -theme default -type fpdialog
         dui page add GrindAdvisor_dose_yield -namespace true -theme default -type fpdialog
-        dui page add GrindAdvisor_bag_stats -namespace true -theme default -type fpdialog
         return GrindAdvisor_settings
     }
 
@@ -3187,6 +3186,299 @@ namespace eval ::plugins::GrindAdvisor {
         return 1
     }
 
+    # ------------------------------------------------------------------
+    #  v3.6.0 Bag Stats card list -- same overlay mechanism and page
+    #  geometry as the history list (5 cards, Prev/Next, Done), fed by
+    #  the v3.5.0 per-bag comparison numbers. Read-only, display only.
+    # ------------------------------------------------------------------
+    variable _bag_offset 0
+    variable _bag_cards {}
+    variable _bag_summary ""
+
+    # Per-bag comparison cards. Returns {summary <text> cards {{l1 l2 l3}...}}.
+    proc _bag_cards_data {{max_bags 25}} {
+        lassign [locate_shot_source] db table fields
+        if {$db eq "" || $table eq ""} {
+            return [dict create summary "No SDB source detected." cards {}]
+        }
+        if {![dict exists $fields bag_fields]} {
+            return [dict create summary "No bean/bag columns detected in SDB." cards {}]
+        }
+        set rows [_filter_valid_rows [_fetch_recent $db $table $fields 600] $fields]
+        if {[llength $rows] == 0} {
+            return [dict create summary "No valid espresso shots found yet." cards {}]
+        }
+        set target [_forecast_target]
+
+        # Group rows (newest-first) by bag key; bag order = most recent first.
+        set order {}
+        set bagrows [dict create]
+        foreach r $rows {
+            set k [_bag_key $r]
+            if {$k eq ""} { set k "(no bag info)" }
+            if {![dict exists $bagrows $k]} { lappend order $k }
+            dict lappend bagrows $k $r
+        }
+
+        set cards {}
+        set r2_sum 0.0
+        set r2_count 0
+        set slopes {}
+        set shown 0
+        foreach k $order {
+            if {$shown >= $max_bags} { break }
+            incr shown
+            set brows [dict get $bagrows $k]
+
+            # Label from the newest row's bag values (bean, then roaster).
+            set label $k
+            set newest [lindex $brows 0]
+            set bv [expr {[dict exists $newest bag_values] ? [dict get $newest bag_values] : {}}]
+            set parts {}
+            foreach f {bean roaster} {
+                set v [string trim [_dget $bv $f]]
+                if {$v ne ""} { lappend parts $v }
+            }
+            if {[llength $parts] > 0} { set label [join $parts " · "] }
+
+            # Eligible shots (newest-first): outliers excluded, normalized
+            # time -- the exact dataset the forecast regression fits.
+            set pts {}
+            set draws {}
+            set traws {}
+            set excluded 0
+            set t_first ""
+            foreach r $brows {
+                if {[_is_outlier $r]} { incr excluded; continue }
+                lassign [_norm_time $r] tnorm active
+                if {$tnorm eq ""} { continue }
+                set sh [_shot_from_row $r]
+                if {[dict size $sh] == 0} { continue }
+                set g [dict get $sh grind]
+                lappend pts [list $g $tnorm]
+                lappend traws [dict get $sh duration]
+                set ts [_dget $r timestamp]
+                if {$ts ne "" && [string is integer -strict $ts]} {
+                    lappend draws [list $g $ts $tnorm]
+                    set t_first $ts
+                }
+            }
+            set n [llength $pts]
+            set ex_txt [expr {$excluded > 0 ? ", $excluded excluded" : ""}]
+
+            set gmin ""; set gmax ""
+            foreach p $pts {
+                set g [lindex $p 0]
+                if {$gmin eq "" || $g < $gmin} { set gmin $g }
+                if {$gmax eq "" || $g > $gmax} { set gmax $g }
+            }
+            set spread [expr {$n > 0 ? $gmax - $gmin : 0.0}]
+
+            # Average-R² feed (same recency-weighted fit as the forecast).
+            if {$n >= 3} {
+                set shots {}
+                foreach p $pts {
+                    lappend shots [dict create grind [lindex $p 0] \
+                        t_raw [lindex $p 1] t_norm [lindex $p 1] norm_active 0]
+                }
+                set reg [_weighted_regression $shots 1]
+                if {[dict get $reg ok] && [dict get $reg r2] ne ""} {
+                    set r2_sum [expr {$r2_sum + [dict get $reg r2]}]
+                    incr r2_count
+                }
+            }
+
+            # Shots-to-target: first raw shot within 2s, oldest first.
+            set stt ""
+            set idx 0
+            foreach t [lreverse $traws] {
+                incr idx
+                if {abs($t - $target) <= 2.0} { set stt $idx; break }
+            }
+            if {$stt eq ""} {
+                set stt_txt "Never within 2s of target"
+            } elseif {$stt == 1} {
+                set stt_txt "On target in 1 shot"
+            } else {
+                set stt_txt "On target in $stt shots"
+            }
+
+            # Robust per-bag calibration with the v3.5.0 trust gate.
+            set fit [_theil_sen $pts]
+            set trusted [expr {$n >= 4 && $spread >= 1.0 && $fit ne "" \
+                && abs([lindex $fit 0]) >= 0.5}]
+            if {$trusted} {
+                lassign $fit m b
+                set ideal [_clamp_grind [expr {($target - $b) / double($m)}]]
+                lappend slopes $m
+                set drift_txt ""
+                if {[llength $draws] >= 6 && $t_first ne ""} {
+                    set dpts {}
+                    set span_d 0.0
+                    foreach p $draws {
+                        lassign $p g ts2 t
+                        set d [expr {($ts2 - $t_first) / 86400.0}]
+                        if {$d > $span_d} { set span_d $d }
+                        lappend dpts [list $g $d $t]
+                    }
+                    if {$span_d >= 3.0} {
+                        set c [_drift_fit $dpts]
+                        if {$c ne ""} {
+                            set drift_txt "  ·  Drift [format %+.1f $c] s/day"
+                        }
+                    }
+                }
+                set l2 "Ideal [format %.1f $ideal]  ·  Slope [format %.1f $m] s/grind$drift_txt"
+            } else {
+                if {$n < 4} {
+                    set why "needs 4+ shots"
+                } elseif {$spread < 1.0} {
+                    set why "grind spread only [format %.1f $spread]"
+                } else {
+                    set why "slope too flat"
+                }
+                set l2 "Fit not reliable ($why)"
+            }
+
+            set l1 $label
+            if {$n > 0} {
+                set d_new [_bag_date_short [_dget $newest timestamp]]
+                set d_old [_bag_date_short [_dget [lindex $brows end] timestamp]]
+                if {$d_old ne "" && $d_new ne ""} {
+                    append l1 "   [expr {$d_old eq $d_new ? $d_new : "$d_old - $d_new"}]"
+                }
+            }
+            set l3 "$stt_txt  ·  $n shots$ex_txt"
+            lappend cards [list $l1 $l2 $l3]
+        }
+
+        set sparts [list "Target [format %.0f $target]s"]
+        if {[llength $slopes] > 0} {
+            lappend sparts "Median slope [format %.1f [_median $slopes]] s/grind ([llength $slopes] reliable bags)"
+        }
+        if {$r2_count > 0} {
+            lappend sparts "Average R² [format %.2f [expr {$r2_sum / double($r2_count)}]]"
+        }
+        return [dict create summary [join $sparts "  ·  "] cards $cards]
+    }
+
+    proc show_bag_stats {} {
+        variable _bag_offset
+        variable _bag_cards
+        variable _bag_summary
+        set _bag_offset 0
+        set data [_bag_cards_data]
+        set _bag_cards [dict get $data cards]
+        set _bag_summary [dict get $data summary]
+        return [_render_bag_stats_dialog]
+    }
+
+    proc _bag_page {delta} {
+        variable _bag_offset
+        variable _bag_cards
+        set total [llength $_bag_cards]
+        set new [expr {$_bag_offset + 5 * $delta}]
+        if {$new < 0} { set new 0 }
+        if {$new >= $total || $new == $_bag_offset} { return }
+        set _bag_offset $new
+        _render_bag_stats_dialog
+    }
+
+    proc _render_bag_stats_dialog {} {
+        variable _bag_offset
+        variable _bag_cards
+        variable _bag_summary
+        lassign [_pgeom] parent W H o
+        if {[catch {
+            catch { destroy $o }
+            set col [_colors]
+            set F [_pfonts $H]
+            set fsec  [dict get $F section]
+            set fprim [dict get $F primary]
+            set fbody [dict get $F body]
+            set fcap  [dict get $F caption]
+            set fbtn  [dict get $F button]
+
+            canvas $o -bg [dict get $col scrim] -highlightthickness 0 -bd 0 -takefocus 0
+            place $o -in $parent -x 0 -y 0 -relwidth 1 -relheight 1
+            raise $o
+
+            set pf [expr {double($H) / 800.0}]
+            set mg [expr {int(max($W * 0.036, 32))}]
+            set lx $mg
+            set rx [expr {$W - $mg}]
+            set cx [expr {($lx + $rx) / 2}]
+            set content_w [expr {$rx - $lx}]
+
+            _otext $o $cx [expr {int(36 * $pf)}] center "Bag Stats" $fsec [dict get $col text] $content_w center bold
+            _otext $o $cx [expr {int(76 * $pf)}] center [_fit_text $_bag_summary $fcap $content_w] \
+                $fcap [dict get $col muted] $content_w center
+
+            set tb0 [expr {int(104 * $pf)}]
+            set tb1 [expr {int(152 * $pf)}]
+            set btnw [expr {int(200.0 * $W / 1340.0)}]
+            set gap [expr {int(10 * $pf)}]
+            set next_x1 [expr {$rx - $btnw}]
+            set prev_x1 [expr {$next_x1 - $gap - $btnw}]
+
+            set total [llength $_bag_cards]
+            if {$total == 0} {
+                set count_text "No bags found."
+            } else {
+                set last [expr {$_bag_offset + 5}]
+                if {$last > $total} { set last $total }
+                set count_text "Bags [expr {$_bag_offset + 1}][format %c 0x2013]$last of $total"
+            }
+            _otext $o $lx [expr {($tb0 + $tb1) / 2}] w [_fit_text $count_text $fcap [expr {$prev_x1 - $lx - $gap}]] \
+                $fcap [dict get $col muted] [expr {$prev_x1 - $lx - $gap}] left
+            _obutton $o $prev_x1 $tb0 [expr {$prev_x1 + $btnw}] $tb1 "[format %c 0x25C0] Prev" $fbtn \
+                [list ::plugins::GrindAdvisor::_bag_page -1]
+            _obutton $o $next_x1 $tb0 $rx $tb1 "Next [format %c 0x25B6]" $fbtn \
+                [list ::plugins::GrindAdvisor::_bag_page 1]
+
+            set list_top [expr {int(168 * $pf)}]
+            set card_h [expr {int(96 * $pf)}]
+            set card_gap [expr {int(12 * $pf)}]
+            set card_r [expr {int(12 * $pf)}]
+            set pad_x [expr {int(18 * $pf)}]
+            set l1_dy [expr {int(30 * $pf)}]
+            set l2_dy [expr {int(56 * $pf)}]
+            set l3_dy [expr {int(80 * $pf)}]
+            set text_x [expr {$lx + $pad_x}]
+            set text_w [expr {$content_w - 2 * $pad_x}]
+
+            for {set i 0} {$i < 5} {incr i} {
+                set idx [expr {$_bag_offset + $i}]
+                if {$idx >= $total} { break }
+                lassign [lindex $_bag_cards $idx] line1 line2 line3
+                set top [expr {$list_top + $i * ($card_h + $card_gap)}]
+                set bottom [expr {$top + $card_h}]
+                _opoly $o $lx $top $rx $bottom $card_r [dict get $col panel] [dict get $col border] gad
+                _otext $o $text_x [expr {$top + $l1_dy}] w [_fit_text $line1 $fprim $text_w] $fprim [dict get $col text] $text_w left bold
+                _otext $o $text_x [expr {$top + $l2_dy}] w [_fit_text $line2 $fbody $text_w] $fbody [dict get $col text] $text_w left
+                _otext $o $text_x [expr {$top + $l3_dy}] w [_fit_text $line3 $fcap $text_w] $fcap [dict get $col muted] $text_w left
+            }
+            if {$total == 0} {
+                _otext $o $cx [expr {$list_top + 2 * ($card_h + $card_gap)}] center \
+                    $_bag_summary $fbody [dict get $col text] $content_w
+            }
+
+            set bar_y0 [expr {int(716 * $pf)}]
+            set bar_y1 [expr {int(776 * $pf)}]
+            _obutton $o $lx $bar_y0 [expr {$lx + $btnw}] $bar_y1 "Done" $fbtn \
+                [list ::plugins::GrindAdvisor::_close_dialog]
+
+            after 200  [list catch [list raise $o]]
+            after 600  [list catch [list raise $o]]
+        } err]} {
+            catch { destroy $o }
+            catch { msg "GrindAdvisor: bag stats dialog failed: $err" }
+            catch { borg toast "Bag Stats unavailable" }
+            return 0
+        }
+        return 1
+    }
+
     proc _get_canvas {} {
         # Known global first.
         if {[info exists ::can] && [_is_canvas $::can]} { return $::can }
@@ -3414,17 +3706,61 @@ namespace eval ::plugins::GrindAdvisor {
     }
 
     # ------------------------------------------------------------------
-    #  Bag Stats (v3.4.0; comparison view v3.5.0) -- READ-ONLY, display
-    #  only. Groups recent valid espresso shots by bag and reports how
-    #  each bag behaved, so bags can be compared: the ideal grind its
-    #  robust fit predicts for the target time, the bean's seconds-per-
-    #  grind slope (Theil-Sen: median of pairwise slopes, so one
-    #  channeled shot can't drag it), the time drift per day of bag life,
-    #  and how many shots it took to land within 2s of target. Average R²
-    #  stays in the header as an overall fit-quality gauge; per-bag trust
-    #  is judged by shot count and grind spread, because a fit through
-    #  shots at one grind setting is arithmetic, not calibration.
-    #  Nothing here feeds back into any recommendation.
+    #  v3.6.0 long-text pagination. The full-width text card fits about
+    #  20 body lines (~24 caption lines); longer content used to run past
+    #  the card and clip under the bottom bar (Help, Calculation
+    #  Details). Split on newlines, charge each line its estimated
+    #  wrapped-line count, and pack pages conservatively so nothing can
+    #  clip; Prev/Next in the bottom bar flips pages.
+    # ------------------------------------------------------------------
+    proc _paginate_text {text max_lines chars_per_line} {
+        set pages {}
+        set cur {}
+        set used 0
+        foreach line [split $text "\n"] {
+            set cost 1
+            set len [string length $line]
+            if {$len > $chars_per_line} {
+                set cost [expr {($len + $chars_per_line - 1) / $chars_per_line}]
+            }
+            if {$used > 0 && $used + $cost > $max_lines} {
+                lappend pages [join $cur "\n"]
+                set cur {}
+                set used 0
+            }
+            lappend cur $line
+            incr used $cost
+        }
+        if {[llength $cur] > 0} { lappend pages [join $cur "\n"] }
+        if {[llength $pages] == 0} { lappend pages "" }
+        return $pages
+    }
+
+    # Shared bottom-bar pager controls for the long-text sub-pages.
+    # Adds Prev/Next (right side) and a page indicator; the caller's
+    # namespace provides a _pg {delta} proc.
+    proc _add_pager {page ns} {
+        variable L
+        set rx $L(right_x)
+        set prev_x0 [expr {$rx - 2 * $L(btn_w_std) - $L(lg)}]
+        set next_x0 [expr {$rx - $L(btn_w_std)}]
+        dui add dtext $page [expr {$prev_x0 - $L(lg)}] [expr {($L(bar_y0) + $L(bar_y1)) / 2}] \
+            -tags pg_ind -text "" -font $L(font_caption) -fill "#666666" -anchor e -justify right
+        dui add dbutton $page $prev_x0 $L(bar_y0) [expr {$prev_x0 + $L(btn_w_std)}] $L(bar_y1) \
+            -tags pg_prev -label "[format %c 0x25C0] [translate "Prev"]" \
+            -command [list ${ns}::_pg -1] -label_font $L(font_button) -style ga_btn
+        dui add dbutton $page $next_x0 $L(bar_y0) $rx $L(bar_y1) \
+            -tags pg_next -label "[translate "Next"] [format %c 0x25B6]" \
+            -command [list ${ns}::_pg 1] -label_font $L(font_button) -style ga_btn
+    }
+
+    # ------------------------------------------------------------------
+    #  Bag Stats helpers (v3.5.0; the card-list dialog itself is
+    #  _bag_cards_data/_render_bag_stats_dialog, v3.6.0) -- READ-ONLY.
+    #  _theil_sen: median of pairwise slopes + median-residual intercept,
+    #  so one channeled shot can't drag the fit. _drift_fit: least-squares
+    #  t = b + m*grind + c*days, Cramer's rule on the 3x3 normal
+    #  equations. Nothing here feeds back into any recommendation.
     # ------------------------------------------------------------------
     proc _bag_date_short {raw} {
         set raw [string trim $raw]
@@ -3493,175 +3829,6 @@ namespace eval ::plugins::GrindAdvisor {
         return [expr {$detc / double($det)}]
     }
 
-    proc _bag_stats_text {{max_bags 8}} {
-        lassign [locate_shot_source] db table fields
-        if {$db eq "" || $table eq ""} {
-            return "Bag statistics unavailable: no SDB source detected."
-        }
-        if {![dict exists $fields bag_fields]} {
-            return "Bag statistics unavailable: no bean/bag columns detected in SDB."
-        }
-        set rows [_filter_valid_rows [_fetch_recent $db $table $fields 600] $fields]
-        if {[llength $rows] == 0} {
-            return "No valid espresso shots found in SDB yet."
-        }
-
-        # Group rows (newest-first) by bag key; bag order = most recent first.
-        set order {}
-        set bagrows [dict create]
-        foreach r $rows {
-            set k [_bag_key $r]
-            if {$k eq ""} { set k "(no bag info)" }
-            if {![dict exists $bagrows $k]} { lappend order $k }
-            dict lappend bagrows $k $r
-        }
-
-        set target [_forecast_target]
-        set entries {}
-        set r2_sum 0.0
-        set r2_count 0
-        set slopes {}
-        set shown 0
-        foreach k $order {
-            if {$shown >= $max_bags} { break }
-            incr shown
-            set brows [dict get $bagrows $k]
-
-            # Label from the newest row's bag values (bean, then roaster).
-            set label $k
-            set newest [lindex $brows 0]
-            set bv [expr {[dict exists $newest bag_values] ? [dict get $newest bag_values] : {}}]
-            set parts {}
-            foreach f {bean roaster} {
-                set v [string trim [_dget $bv $f]]
-                if {$v ne ""} { lappend parts $v }
-            }
-            if {[llength $parts] > 0} { set label [join $parts " · "] }
-
-            # Eligible shots (newest-first): outliers excluded, normalized
-            # time -- the exact dataset the forecast regression fits.
-            set pts {}
-            set draws {}
-            set traws {}
-            set excluded 0
-            set t_first ""
-            foreach r $brows {
-                if {[_is_outlier $r]} { incr excluded; continue }
-                lassign [_norm_time $r] tnorm active
-                if {$tnorm eq ""} { continue }
-                set sh [_shot_from_row $r]
-                if {[dict size $sh] == 0} { continue }
-                set g [dict get $sh grind]
-                lappend pts [list $g $tnorm]
-                lappend traws [dict get $sh duration]
-                set ts [_dget $r timestamp]
-                if {$ts ne "" && [string is integer -strict $ts]} {
-                    lappend draws [list $g $ts $tnorm]
-                    set t_first $ts
-                }
-            }
-            set n [llength $pts]
-            set ex_txt [expr {$excluded > 0 ? ", $excluded excluded" : ""}]
-
-            # Grind spread and the average R² feed (same fit as v3.4.0).
-            set gmin ""; set gmax ""
-            foreach p $pts {
-                set g [lindex $p 0]
-                if {$gmin eq "" || $g < $gmin} { set gmin $g }
-                if {$gmax eq "" || $g > $gmax} { set gmax $g }
-            }
-            set spread [expr {$n > 0 ? $gmax - $gmin : 0.0}]
-            if {$n >= 3} {
-                set shots {}
-                foreach p $pts {
-                    lappend shots [dict create grind [lindex $p 0] \
-                        t_raw [lindex $p 1] t_norm [lindex $p 1] norm_active 0]
-                }
-                set reg [_weighted_regression $shots 1]
-                if {[dict get $reg ok] && [dict get $reg r2] ne ""} {
-                    set r2_sum [expr {$r2_sum + [dict get $reg r2]}]
-                    incr r2_count
-                }
-            }
-
-            # Shots-to-target: first raw shot time within 2s, oldest first.
-            set stt ""
-            set idx 0
-            foreach t [lreverse $traws] {
-                incr idx
-                if {abs($t - $target) <= 2.0} { set stt $idx; break }
-            }
-            if {$stt eq ""} {
-                set stt_txt "never within 2s"
-            } elseif {$stt == 1} {
-                set stt_txt "on target in 1 shot"
-            } else {
-                set stt_txt "on target in $stt shots"
-            }
-
-            # Robust per-bag calibration; trusted only with enough shots
-            # AND real grind spread.
-            set ts [_theil_sen $pts]
-            set trusted [expr {$n >= 4 && $spread >= 1.0 && $ts ne "" \
-                && abs([lindex $ts 0]) >= 0.5}]
-            if {$trusted} {
-                lassign $ts m b
-                set ideal [_clamp_grind [expr {($target - $b) / double($m)}]]
-                lappend slopes $m
-                set drift_txt ""
-                if {[llength $draws] >= 6 && $t_first ne ""} {
-                    set dpts {}
-                    set span_d 0.0
-                    foreach p $draws {
-                        lassign $p g ts2 t
-                        set d [expr {($ts2 - $t_first) / 86400.0}]
-                        if {$d > $span_d} { set span_d $d }
-                        lappend dpts [list $g $d $t]
-                    }
-                    if {$span_d >= 3.0} {
-                        set c [_drift_fit $dpts]
-                        if {$c ne ""} {
-                            set drift_txt " · drift [format %+.1f $c] s/day"
-                        }
-                    }
-                }
-                set stat "ideal [format %.1f $ideal] · slope [format %.1f $m] s/grind$drift_txt"
-            } else {
-                if {$n < 4} {
-                    set why "needs 4+ shots"
-                } elseif {$spread < 1.0} {
-                    set why "grind spread only [format %.1f $spread]"
-                } else {
-                    set why "slope too flat"
-                }
-                set stat "fit not reliable ($why)"
-            }
-            set head "$shown) $label"
-            if {$n > 0} {
-                set d_new [_bag_date_short [_dget $newest timestamp]]
-                set d_old [_bag_date_short [_dget [lindex $brows end] timestamp]]
-                if {$d_old ne "" && $d_new ne ""} {
-                    append head "  ([expr {$d_old eq $d_new ? $d_new : "$d_old - $d_new"}])"
-                }
-            }
-            lappend entries $head
-            lappend entries "     $stat · $stt_txt · $n shots$ex_txt"
-        }
-
-        set lines {}
-        lappend lines "Latest $shown of [llength $order] bag(s) in the last [llength $rows] valid shots. Target [format %.0f $target]s."
-        if {[llength $slopes] > 0} {
-            lappend lines "Median bean slope: [format %.1f [_median $slopes]] s/grind (from [llength $slopes] reliable bag(s))."
-        }
-        if {$r2_count > 0} {
-            lappend lines "Average R²: [format %.2f [expr {$r2_sum / double($r2_count)}]] across $r2_count fitted bag(s)."
-        }
-        lappend lines ""
-        lappend lines {*}$entries
-        lappend lines ""
-        lappend lines "Ideal = the grind this bag's robust fit (median of pairwise slopes, so one channeled shot can't drag it) predicts for your target time. Slope = the bean's seconds per grind step. Drift = how shot time moved per day of bag life (shown with 6+ dated shots over 3+ days). A fit is only reliable with enough shots and grind spread; shots all at one setting can't calibrate. R² stays as an overall fit-quality gauge."
-        return [join $lines "\n"]
-    }
 }
 
 namespace eval ::dui::pages::GrindAdvisor_settings {
@@ -3696,7 +3863,8 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
         set col_w $L(sec_col_w)
         set c2x $L(sec_col2_x)
         set shot_h [expr {2 * $L(sec_pad) + $L(sec_title_h) + $L(md) + 3 * $L(entry_row_pitch) - $L(md)}]
-        set act_h  [expr {2 * $L(sec_pad) + $L(sec_title_h) + $L(md) + 2 * $L(btn_h) + $L(md)}]
+        # v3.6.0: three action buttons (Recommendation / History / Bag Stats).
+        set act_h  [expr {2 * $L(sec_pad) + $L(sec_title_h) + $L(md) + 3 * $L(btn_h) + 2 * $L(md)}]
         set two_h  [expr {2 * $L(sec_pad) + $L(sec_title_h) + $L(md) + 2 * $L(row_pitch) - $L(md)}]
         set three_h [expr {2 * $L(sec_pad) + $L(sec_title_h) + $L(md) + 3 * $L(row_pitch) - $L(md)}]
 
@@ -3735,6 +3903,11 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
         dui add dbutton $page $abtn_x1 $rows_y $abtn_x2 [expr {$rows_y + $L(btn_h)}] \
             -tags recent_shot_history -label [translate "History"] \
             -command ::plugins::GrindAdvisor::_show_history_dialog \
+            -label_font $L(font_button) -style ga_btn
+        set rows_y [expr {$rows_y + $L(btn_h) + $L(md)}]
+        dui add dbutton $page $abtn_x1 $rows_y $abtn_x2 [expr {$rows_y + $L(btn_h)}] \
+            -tags bag_stats_action -label [translate "Bag Stats"] \
+            -command ::plugins::GrindAdvisor::show_bag_stats \
             -label_font $L(font_button) -style ga_btn
 
         # --- RIGHT column: Recommendation (2 rows: rounding control + the
@@ -4002,8 +4175,7 @@ namespace eval ::dui::pages::GrindAdvisor_advanced {
             1 0 history_display_options "History Display Options" GrindAdvisor_history_options \
             0 1 diagnostics "Diagnostics" GrindAdvisor_diagnostics \
             1 1 calculation_details "Calculation Details" GrindAdvisor_calculation_details \
-            0 2 help_guide "Help / Guide" GrindAdvisor_help \
-            1 2 bag_stats "Bag Stats" GrindAdvisor_bag_stats] {
+            0 2 help_guide "Help / Guide" GrindAdvisor_help] {
             set bx [expr {$c == 0 ? $bx0 : $bx1}]
             set by [expr {$rows_y + $r * $L(row_pitch)}]
             dui add dbutton $page $bx $by [expr {$bx + $half_w}] [expr {$by + $L(btn_h)}] \
@@ -4011,6 +4183,14 @@ namespace eval ::dui::pages::GrindAdvisor_advanced {
                 -command [list ::plugins::GrindAdvisor::open_settings_dialog $target] \
                 -label_font $L(font_button) -style ga_btn
         }
+        # v3.6.0: Bag Stats opens the overlay card list (same mechanism as
+        # History), not a dui page, so it fills the free (row 2, col 2) slot
+        # with its own command.
+        set by [expr {$rows_y + 2 * $L(row_pitch)}]
+        dui add dbutton $page $bx1 $by [expr {$bx1 + $half_w}] [expr {$by + $L(btn_h)}] \
+            -tags bag_stats -label [translate "Bag Stats"] \
+            -command ::plugins::GrindAdvisor::show_bag_stats \
+            -label_font $L(font_button) -style ga_btn
 
         dui add dbutton $page $lx $L(bar_y0) [expr {$lx + $L(btn_w_std)}] $L(bar_y1) \
             -tags page_done -label [translate "Done"] \
@@ -4058,18 +4238,45 @@ namespace eval ::dui::pages::GrindAdvisor_help {
             "" \
             "Dose / Yield Source (Advanced) chooses which dose and yield the plugin reports. Fixed uses your set dose and target yield. Actual uses the measured dose and final yield when present. Auto (default) uses measured values only when they pass plausibility (dose within Dose min/max, ratio within Ratio min/max), otherwise it falls back to the set values; a missing or zero measurement always falls back. The popup, reason line, and Diagnostics always state which source was used, e.g. 'dose: actual 18.4g' or 'dose: set 18.0g (actual 0.0g rejected)'. The grind recommendation is based on shot time only, so this choice never changes the recommended grind."] "\n"]
 
+        variable data
+        set data(full_text) $body
+
         set card_h [expr {$L(bar_y0) - $L(md) - $L(sec_top)}]
         set rows_y [::plugins::GrindAdvisor::_sec_card $page sec_help $lx $L(sec_top) $L(content_w) $card_h "Guide"]
-        dui add dtext $page [expr {$lx + $L(sec_pad)}] $rows_y -tags help_text -text $body \
+        # v3.6.0: text is paginated (the full guide is ~2 cards tall and
+        # used to clip under the bottom bar); Prev/Next flip pages.
+        dui add dtext $page [expr {$lx + $L(sec_pad)}] $rows_y -tags help_text -text "" \
             -font $L(font_body) -width [expr {$L(content_w) - 2 * $L(sec_pad)}] -fill "#444444" -anchor nw -justify left
 
         dui add dbutton $page $lx $L(bar_y0) [expr {$lx + $L(btn_w_std)}] $L(bar_y1) \
             -tags page_done -label [translate "Done"] \
             -command ::dui::pages::GrindAdvisor_help::page_done \
             -label_font $L(font_button) -style ga_btn
+        ::plugins::GrindAdvisor::_add_pager $page [namespace current]
     }
 
-    proc show { page_to_hide page_to_show } {}
+    proc show { page_to_hide page_to_show } {
+        variable data
+        set data(pages) [::plugins::GrindAdvisor::_paginate_text $data(full_text) 19 115]
+        set data(page_idx) 0
+        _render $page_to_show
+    }
+
+    proc _render {page} {
+        variable data
+        set total [llength $data(pages)]
+        catch { dui item config $page help_text -text [lindex $data(pages) $data(page_idx)] }
+        set ind [expr {$total > 1 ? "Page [expr {$data(page_idx) + 1}] / $total" : ""}]
+        catch { dui item config $page pg_ind -text $ind }
+    }
+
+    proc _pg {delta} {
+        variable data
+        set new [expr {$data(page_idx) + $delta}]
+        if {$new < 0 || $new >= [llength $data(pages)]} { return }
+        set data(page_idx) $new
+        _render GrindAdvisor_help
+    }
 
     proc page_done {} {
         ::plugins::GrindAdvisor::_exit_subpage
@@ -4103,12 +4310,31 @@ namespace eval ::dui::pages::GrindAdvisor_diagnostics {
             -tags page_done -label [translate "Done"] \
             -command ::dui::pages::GrindAdvisor_diagnostics::page_done \
             -label_font $L(font_button) -style ga_btn
+        ::plugins::GrindAdvisor::_add_pager $page [namespace current]
     }
 
     proc show { page_to_hide page_to_show } {
         variable data
-        set data(diagnostics_text) [::plugins::GrindAdvisor::detected_fields_text]
-        catch { dui item config $page_to_show diagnostics_text -text $data(diagnostics_text) }
+        set data(pages) [::plugins::GrindAdvisor::_paginate_text \
+            [::plugins::GrindAdvisor::detected_fields_text] 19 115]
+        set data(page_idx) 0
+        _render $page_to_show
+    }
+
+    proc _render {page} {
+        variable data
+        set total [llength $data(pages)]
+        catch { dui item config $page diagnostics_text -text [lindex $data(pages) $data(page_idx)] }
+        set ind [expr {$total > 1 ? "Page [expr {$data(page_idx) + 1}] / $total" : ""}]
+        catch { dui item config $page pg_ind -text $ind }
+    }
+
+    proc _pg {delta} {
+        variable data
+        set new [expr {$data(page_idx) + $delta}]
+        if {$new < 0 || $new >= [llength $data(pages)]} { return }
+        set data(page_idx) $new
+        _render GrindAdvisor_diagnostics
     }
 
     proc page_done {} {
@@ -4145,12 +4371,33 @@ namespace eval ::dui::pages::GrindAdvisor_calculation_details {
             -tags page_done -label [translate "Done"] \
             -command ::dui::pages::GrindAdvisor_calculation_details::page_done \
             -label_font $L(font_button) -style ga_btn
+        ::plugins::GrindAdvisor::_add_pager $page [namespace current]
     }
 
     proc show { page_to_hide page_to_show } {
         variable data
-        set data(calculation_text) "[::plugins::GrindAdvisor::_calculation_diagnostics_text]\n\n[::plugins::GrindAdvisor::_shot_trace_text 5]"
-        catch { dui item config $page_to_show calculation_text -text $data(calculation_text) }
+        # v3.6.0: summary + 5-shot trace is ~1.5 cards tall at caption
+        # size and used to clip under the bottom bar; now paginated.
+        set data(pages) [::plugins::GrindAdvisor::_paginate_text \
+            "[::plugins::GrindAdvisor::_calculation_diagnostics_text]\n\n[::plugins::GrindAdvisor::_shot_trace_text 5]" 23 135]
+        set data(page_idx) 0
+        _render $page_to_show
+    }
+
+    proc _render {page} {
+        variable data
+        set total [llength $data(pages)]
+        catch { dui item config $page calculation_text -text [lindex $data(pages) $data(page_idx)] }
+        set ind [expr {$total > 1 ? "Page [expr {$data(page_idx) + 1}] / $total" : ""}]
+        catch { dui item config $page pg_ind -text $ind }
+    }
+
+    proc _pg {delta} {
+        variable data
+        set new [expr {$data(page_idx) + $delta}]
+        if {$new < 0 || $new >= [llength $data(pages)]} { return }
+        set data(page_idx) $new
+        _render GrindAdvisor_calculation_details
     }
 
     proc page_done {} {
@@ -4253,46 +4500,3 @@ namespace eval ::dui::pages::GrindAdvisor_dose_yield {
     }
 }
 
-namespace eval ::dui::pages::GrindAdvisor_bag_stats {
-    # v3.4.0 sub-page (under Advanced -> Tools). Read-only, display only:
-    # per-bag calibration fit (R2, slope, eligible shots) and the average
-    # R2 across fitted bags, built fresh from SDB on every show.
-    variable data
-    array set data {
-        bag_stats_text {}
-    }
-
-    proc setup {} {
-        set page [namespace tail [namespace current]]
-        upvar #0 ::plugins::GrindAdvisor::L L
-        set lx $L(left_x)
-        set cx $L(center_x)
-
-        dui add dtext $page $cx $L(header_title_y) -tags page_title -text [translate "Bag Stats"] \
-            -font $L(font_title) -width $L(content_w) -fill "#2b2b2b" -anchor center -justify center
-        dui add dtext $page $cx $L(header_subtitle_y) -tags subtitle \
-            -text [translate "Calibration fit per bag from your saved shots. Read-only."] \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor center -justify center
-
-        set card_h [expr {$L(bar_y0) - $L(md) - $L(sec_top)}]
-        set rows_y [::plugins::GrindAdvisor::_sec_card $page sec_bags $lx $L(sec_top) $L(content_w) $card_h "Calibration by Bag"]
-        # Caption font so up to 8 bags plus the summary block fit the card.
-        dui add dtext $page [expr {$lx + $L(sec_pad)}] $rows_y -tags bag_stats_text -text "" \
-            -font $L(font_caption) -width [expr {$L(content_w) - 2 * $L(sec_pad)}] -fill "#444444" -anchor nw -justify left
-
-        dui add dbutton $page $lx $L(bar_y0) [expr {$lx + $L(btn_w_std)}] $L(bar_y1) \
-            -tags page_done -label [translate "Done"] \
-            -command ::dui::pages::GrindAdvisor_bag_stats::page_done \
-            -label_font $L(font_button) -style ga_btn
-    }
-
-    proc show { page_to_hide page_to_show } {
-        variable data
-        set data(bag_stats_text) [::plugins::GrindAdvisor::_bag_stats_text]
-        catch { dui item config $page_to_show bag_stats_text -text $data(bag_stats_text) }
-    }
-
-    proc page_done {} {
-        ::plugins::GrindAdvisor::_exit_subpage
-    }
-}

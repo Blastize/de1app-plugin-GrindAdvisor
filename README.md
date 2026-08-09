@@ -1,6 +1,6 @@
-# Grind Advisor v3.5.0
+# Grind Advisor v3.6.0
 
-Current plugin version: **v3.5.0**.
+Current plugin version: **v3.6.0**.
 
 A DE1app (Decent Espresso) plugin. After every completed espresso shot it
 reads your latest shot from **SDB** and shows a popup recommending your next
@@ -117,10 +117,12 @@ the method used, the learned slope, the model fit (R²), the eligible shot
 count, and every intermediate. The possible-channeling warning is
 display-only and does not override the recommendation.
 
-## Bag Stats — compare how each bag behaved (v3.5.0)
+## Bag Stats — compare how each bag behaved (v3.5.0, card list v3.6.0)
 
-**Advanced → Tools → Bag Stats** lists the latest 8 bags, newest first, so
-bags can be compared at a glance. Each bag shows:
+**Bag Stats** — on the main page's Actions card and under Advanced → Tools —
+lists your bags newest first as a card list (same look and paging as the
+History list: 5 cards per page, ◀ Prev / Next ▶, up to 25 bags), so bags can
+be compared at a glance. Each bag card shows:
 
 * **ideal** — the grind its robust fit predicts for your target time,
 * **slope** — the bean's seconds-per-grind (Theil–Sen: the median of all
@@ -136,6 +138,10 @@ reason — shots pulled all at one grind setting can't calibrate anything.
 The header shows the **median bean slope** across reliable bags (the number
 that carries between bags) and the average R² as an overall fit-quality
 gauge. R² itself is per bag and resets when the bag changes.
+
+Long text pages (Help / Guide, Calculation Details, Diagnostics) paginate
+with ◀ Prev / Next ▶ in the bottom bar instead of clipping when the content
+outgrows the card (fixed in v3.6.0).
 
 Everything is computed read-only from your saved shots (normalized time,
 outliers excluded) and is display-only — it never changes any
