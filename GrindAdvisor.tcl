@@ -213,6 +213,17 @@ namespace eval ::plugins::GrindAdvisor {
         set L(btn_h) [expr {int(max(60, round(60 * $scale)))}]
         set L(btn_radius) [expr {int(round(12 * $scale))}]
         set L(card_radius) $L(btn_radius)
+
+        # v3.6.1: self-contained colors (BeanScanner v0.1.2 / SHE v0.5.4
+        # pattern). The plugin paints its own page background and its button
+        # style carries explicit fills, so nothing depends on which dui
+        # theme is current at load time (Lumen's DYE integration switches
+        # the current theme to DYE_Lumen mid-load; this plugin escaped the
+        # resulting invisible-button bug only by loading before the switch).
+        set L(page_bg) "#d5d6e3"           ;# stock settings-page grey
+        set L(btn_fill) "#c0c5e3"          ;# stock dbutton periwinkle
+        set L(btn_disabled_fill) "#dddddd"
+        set L(btn_label_fill) white
         set L(sec_radius) $L(card_radius)
 
         set L(header_title_y) [expr {int(round(28 * $scale))}]
@@ -253,7 +264,31 @@ namespace eval ::plugins::GrindAdvisor {
         # Shared button aspect style: same corner radius everywhere. Label
         # fonts are passed per-instance via -label_font (the aspect
         # font_size key is not honored on the tablet -- SHE v0.3.3 lesson).
-        catch { dui aspect set -type dbutton -style ga_btn [list shape round radius $L(btn_radius)] }
+        #
+        # -theme default is REQUIRED (BeanScanner v0.1.2 lesson): without
+        # it, "dui aspect set" writes into whatever theme is current, and
+        # any load-order change (e.g. Lumen's `dui theme set DYE_Lumen` at
+        # skin.tcl:1831 running first) would leave these -theme default
+        # pages unable to find the style -- buttons then render with no
+        # shape at all, as happened to ShotHistoryEditor v0.5.3.
+        catch {
+            dui aspect set -theme default -type dbutton -style ga_btn [list \
+                shape round radius $L(btn_radius) \
+                fill $L(btn_fill) disabledfill $L(btn_disabled_fill)]
+            dui aspect set -theme default -type dbutton_label -style ga_btn [list \
+                fill $L(btn_label_fill) disabledfill "#999999"]
+        }
+    }
+
+    # Full-page background, drawn as the first item of every page so the
+    # plugin's contrast never depends on the active skin theme (fpdialog
+    # pages otherwise show whatever page or canvas lies beneath them --
+    # near-black under Lumen's dark mode). Copied verbatim from
+    # BeanScanner's proven _page_bg (also SHE v0.5.4).
+    proc _page_bg {page} {
+        variable L
+        dui add canvas_item rect $page 0 0 $L(screen_w) $L(screen_h) \
+            -fill $L(page_bg) -outline $L(page_bg) -tags page_bg
     }
 
     # Rounded-rectangle backdrop via the dui canvas_item wrapper (smoothed
@@ -3844,6 +3879,7 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
     proc setup {} {
         set page [namespace tail [namespace current]]
         upvar #0 ::plugins::GrindAdvisor::L L
+        ::plugins::GrindAdvisor::_page_bg $page
         set lx $L(left_x)
         set rx $L(right_x)
         set cx $L(center_x)
@@ -4066,6 +4102,7 @@ namespace eval ::dui::pages::GrindAdvisor_history_options {
     proc setup {} {
         set page [namespace tail [namespace current]]
         upvar #0 ::plugins::GrindAdvisor::L L
+        ::plugins::GrindAdvisor::_page_bg $page
         set lx $L(left_x)
         set cx $L(center_x)
 
@@ -4126,6 +4163,7 @@ namespace eval ::dui::pages::GrindAdvisor_advanced {
     proc setup {} {
         set page [namespace tail [namespace current]]
         upvar #0 ::plugins::GrindAdvisor::L L
+        ::plugins::GrindAdvisor::_page_bg $page
         set lx $L(left_x)
         set rx $L(right_x)
         set cx $L(center_x)
@@ -4212,6 +4250,7 @@ namespace eval ::dui::pages::GrindAdvisor_help {
     proc setup {} {
         set page [namespace tail [namespace current]]
         upvar #0 ::plugins::GrindAdvisor::L L
+        ::plugins::GrindAdvisor::_page_bg $page
         set lx $L(left_x)
         set cx $L(center_x)
 
@@ -4292,6 +4331,7 @@ namespace eval ::dui::pages::GrindAdvisor_diagnostics {
     proc setup {} {
         set page [namespace tail [namespace current]]
         upvar #0 ::plugins::GrindAdvisor::L L
+        ::plugins::GrindAdvisor::_page_bg $page
         set lx $L(left_x)
         set cx $L(center_x)
 
@@ -4351,6 +4391,7 @@ namespace eval ::dui::pages::GrindAdvisor_calculation_details {
     proc setup {} {
         set page [namespace tail [namespace current]]
         upvar #0 ::plugins::GrindAdvisor::L L
+        ::plugins::GrindAdvisor::_page_bg $page
         set lx $L(left_x)
         set cx $L(center_x)
 
@@ -4414,6 +4455,7 @@ namespace eval ::dui::pages::GrindAdvisor_dose_yield {
     proc setup {} {
         set page [namespace tail [namespace current]]
         upvar #0 ::plugins::GrindAdvisor::L L
+        ::plugins::GrindAdvisor::_page_bg $page
         set lx $L(left_x); set rx $L(right_x); set cx $L(center_x)
 
         dui add dtext $page $cx $L(header_title_y) -tags page_title -text [translate "Dose / Yield Source"] \
@@ -4428,13 +4470,18 @@ namespace eval ::dui::pages::GrindAdvisor_dose_yield {
         set rows_y [::plugins::GrindAdvisor::_sec_card $page sec_dy $lx $L(sec_top) $L(content_w) $card_h "Source Mode"]
 
         set mid [expr {$rows_y + $L(btn_h) / 2}]
-        set btn_x1 [expr {$rx - $L(btn_w_std)}]
+        # v3.6.2: the button's right edge is inset by sec_pad so it keeps
+        # the card's inner padding instead of sitting flush on the card
+        # border (owner-reported; same rule every other in-card button
+        # already follows).
+        set btn_x2 [expr {$rx - $L(sec_pad)}]
+        set btn_x1 [expr {$btn_x2 - $L(btn_w_std)}]
         dui add dtext $page [expr {$lx + $L(sec_pad)}] $mid -tags mode_label -text [translate "Dose / yield mode"] \
             -font $L(font_body) -width $L(sec_label_w) -fill "#444444" -anchor w -justify left
         dui add dtext $page [expr {$lx + $L(sec_value_dx)}] $mid -tags mode_value -text "" \
             -font $L(font_primary) -width [expr {$btn_x1 - $L(lg) - ($lx + $L(sec_value_dx))}] \
             -fill "#4e85f4" -anchor w -justify left
-        dui add dbutton $page $btn_x1 $rows_y $rx [expr {$rows_y + $L(btn_h)}] \
+        dui add dbutton $page $btn_x1 $rows_y $btn_x2 [expr {$rows_y + $L(btn_h)}] \
             -tags mode_btn -label [translate "Next"] \
             -command ::dui::pages::GrindAdvisor_dose_yield::cycle_mode \
             -label_font $L(font_button) -style ga_btn

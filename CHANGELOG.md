@@ -1,5 +1,34 @@
 # Grind Advisor — Changelog
 
+## v3.6.2 (Dose/Yield page: Next button inset from the card border) — TABLET-VERIFIED 2026-08-09
+
+Safety status: **no write behavior exists in this version.** One-geometry
+bugfix, display only.
+
+Owner-reported: on Advanced → Dose / Yield Source, the "Next" button's right
+edge sat flush on the card border. It was drawn to the content edge (`$rx`)
+instead of being inset by the card's inner padding. Now `btn_x2 = rx −
+sec_pad`, matching the rule every other in-card button already follows
+(card action button right inner edge = card right − padding). Nothing else
+changed.
+
+## v3.6.1 (theme hardening — self-painted page background, themed button style) — TABLET-VERIFIED 2026-08-09
+
+Safety status: **no write behavior exists in this version.** Display-only
+hardening; no math, navigation, or data changes.
+
+Prompted by ShotHistoryEditor v0.5.4's root-cause analysis: Lumen's DYE
+integration switches the current dui theme to DYE_Lumen mid-load
+(skins/Lumen/skin.tcl:1831). GrindAdvisor's un-themed `ga_btn` aspect only
+kept working because this plugin happens to load *before* that switch, and
+its fpdialog pages were never painting their own background — the grey seen
+behind them was whatever page lay beneath. Both latent defects fixed with
+the BeanScanner v0.1.2 pattern, copied verbatim: `ga_btn` registered with
+`-theme default` plus explicit fill/disabledfill and label fills (stock
+periwinkle/white — identical rendered look), and `_page_bg` paints an
+explicit full-page grey (#d5d6e3) as the first item of all 7 dui pages.
+Color tokens added to the layout block.
+
 ## v3.6.0 (Bag Stats card list + Actions entry; long-text clipping fixed) — TABLET-VERIFIED 2026-08-09
 
 Safety status: **no write behavior exists in this version.** Read-only SDB
