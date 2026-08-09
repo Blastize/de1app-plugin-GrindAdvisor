@@ -1,6 +1,6 @@
-# Grind Advisor v3.4.0
+# Grind Advisor v3.5.0
 
-Current plugin version: **v3.4.0**.
+Current plugin version: **v3.5.0**.
 
 A DE1app (Decent Espresso) plugin. After every completed espresso shot it
 reads your latest shot from **SDB** and shows a popup recommending your next
@@ -117,16 +117,29 @@ the method used, the learned slope, the model fit (R²), the eligible shot
 count, and every intermediate. The possible-channeling warning is
 display-only and does not override the recommendation.
 
-## Bag Stats (v3.4.0)
+## Bag Stats — compare how each bag behaved (v3.5.0)
 
-R² is **per bag**: it measures how well that bag's own shots fit its
-time-vs-grind line, and it resets when the bag changes. **Advanced → Tools →
-Bag Stats** lists the latest 8 bags with each bag's R², learned slope
-(s/grind), eligible shot count and excluded outliers, plus the **average R²
-across all fitted bags** and the median bean slope of good fits. Everything
-is computed with the same regression the forecast itself uses (normalized
-time, recency weights, outliers excluded). The page is read-only and
-display-only — it never changes any recommendation.
+**Advanced → Tools → Bag Stats** lists the latest 8 bags, newest first, so
+bags can be compared at a glance. Each bag shows:
+
+* **ideal** — the grind its robust fit predicts for your target time,
+* **slope** — the bean's seconds-per-grind (Theil–Sen: the median of all
+  pairwise slopes, so one channeled shot can't drag the number),
+* **drift** — how the bean's shot time moved per day of bag life (beans
+  speed up as they degas; shown with 6+ dated shots over 3+ days),
+* **on target in N shots** — how quickly the bag was dialed in (±2s),
+* shot count and excluded outliers.
+
+A bag only gets numbers when the fit is trustworthy (4+ eligible shots and
+at least 1.0 of grind spread); otherwise it says "fit not reliable" with the
+reason — shots pulled all at one grind setting can't calibrate anything.
+The header shows the **median bean slope** across reliable bags (the number
+that carries between bags) and the average R² as an overall fit-quality
+gauge. R² itself is per bag and resets when the bag changes.
+
+Everything is computed read-only from your saved shots (normalized time,
+outliers excluded) and is display-only — it never changes any
+recommendation.
 
 ## Defensive SDB handling (read-only)
 
