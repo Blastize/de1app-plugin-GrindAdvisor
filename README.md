@@ -6,7 +6,7 @@ A DE1app (Decent Espresso) plugin. After every completed espresso shot it
 reads your latest shot from **SDB** and shows a popup recommending your next
 grind setting. You enter nothing by hand.
 
-<img src="images/popup.png" alt="Grind Advisor after-shot popup" width="620">
+<img src="images/shot-analysis-popup.jpg" alt="Grind Advisor after-shot popup" width="620">
 
 Dose, Yield, and Ratio lines appear automatically when those columns exist in
 SDB; if they aren't stored, those lines are simply omitted.
@@ -16,7 +16,7 @@ SDB; if they aren't stored, those lines are simply omitted.
 **Curve** shows what the recommendation is actually standing on. **Back**
 returns to the popup.
 
-<img src="images/calibration_curve.png" alt="Calibration Curve view" width="740">
+<img src="images/calibration-curve.jpg" alt="Calibration Curve view" width="740">
 
 * **Top panel** — every eligible shot on the current bag, the line the model
   solved, a dashed guide at your target time, and a labelled dashed vertical
@@ -194,6 +194,8 @@ this is where to look:
   right page name in `_open_history` in `GrindAdvisor.tcl`.
 
 ## Settings
+
+<img src="images/settings-page.jpg" alt="Grind Advisor settings page" width="740">
 
 Defaults live in `plugin.tcl` under `::plugins::GrindAdvisor::settings`:
 
