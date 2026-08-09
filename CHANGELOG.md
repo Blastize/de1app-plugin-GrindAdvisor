@@ -1,5 +1,20 @@
 # Grind Advisor — Changelog
 
+## v3.6.3 (display-name consistency: "Grind Advisor" in all prose) — docs only, 2026-08-10
+
+Safety status: **no write behavior exists in this version.** Docs-only pass;
+the only code change is the version string in `plugin.tcl`.
+
+Owner request (raised while announcing the plugin on the dcamp forum): the
+display name is always written "Grind Advisor" (with a space), consistent
+with "Bean Scanner" and "Shot History Editor". Every user-visible UI string
+and `plugin.tcl`'s `name` metadata already used the spaced form; this pass
+aligns the remaining prose mentions in README, CHANGELOG, and PROJECT_STATE.
+Technical identifiers are deliberately unchanged: the `GrindAdvisor`
+folder/namespace, `GrindAdvisor_*` page names, filenames, install paths,
+`msg` log prefixes, and the GitHub repo name `de1app-plugin-GrindAdvisor`.
+No tablet verification needed (no behavior change).
+
 ## v3.6.2 (Dose/Yield page: Next button inset from the card border) — TABLET-VERIFIED 2026-08-09
 
 Safety status: **no write behavior exists in this version.** One-geometry
@@ -19,7 +34,7 @@ hardening; no math, navigation, or data changes.
 
 Prompted by ShotHistoryEditor v0.5.4's root-cause analysis: Lumen's DYE
 integration switches the current dui theme to DYE_Lumen mid-load
-(skins/Lumen/skin.tcl:1831). GrindAdvisor's un-themed `ga_btn` aspect only
+(skins/Lumen/skin.tcl:1831). Grind Advisor's un-themed `ga_btn` aspect only
 kept working because this plugin happens to load *before* that switch, and
 its fpdialog pages were never painting their own background — the grey seen
 behind them was whatever page lay beneath. Both latent defects fixed with
@@ -758,7 +773,7 @@ history-file code was touched; this pass only changes Done/Back navigation.
 `page_stack` to a single entry, `[dict create $page_to_show {}]`, every time
 a page of type `"default"` is shown -- e.g. the flow-monitor screen shown
 while a flush/rinse/steam runs. This happens even while a `fpdialog` page
-(GrindAdvisor's settings pages) is current, because the "only one dialog
+(Grind Advisor's settings pages) is current, because the "only one dialog
 page can be visible" guard a few lines above (~line 6415) only checks page
 type `"dialog"`, not `"fpdialog"`. When the app re-shows
 `GrindAdvisor_settings` after the flow ends, it gets pushed onto that
@@ -767,7 +782,7 @@ freshly-wiped stack, so `page_stack` becomes
 `::dui::page::close_dialog` (~line 6780) navigates to `previous`, defined as
 the second-to-last key of `page_stack` (`::dui::page::previous`, ~line 5964)
 -- i.e. the flow page. **This is exactly why Done lands on the flush
-screen**, and it is not specific to GrindAdvisor: it is how this DE1app
+screen**, and it is not specific to Grind Advisor: it is how this DE1app
 build's `page_stack` behaves for any `fpdialog` left open across a
 state-driven page change, with no self-healing.
 
@@ -780,7 +795,7 @@ proc calls `dui page load $::gfc_start_page` directly.
 
 ### Fix (convergence, grounded in the confirmed mechanism)
 
-* Every GrindAdvisor page's `show{page_to_hide page_to_show}` callback
+* Every Grind Advisor page's `show{page_to_hide page_to_show}` callback
   (called by `::dui::page::load` itself on every single page-show, genuine
   entry or not) now calls `_capture_return_page $page_to_hide`, which
   records the real previous page as `_settings_return_page` -- but skips the
@@ -859,13 +874,13 @@ navigation call.
 v1.8.5's fix made Done crash with the same `A_Flow` plugin-load error on
 *every* press, not just after a flush interruption. Root cause: v1.8.5
 copied Graphical_Flow_Calibrator's `dui page load $return_page` pattern, but
-GFC's pages are plain top-level pages, never `-type fpdialog`. GrindAdvisor's
+GFC's pages are plain top-level pages, never `-type fpdialog`. Grind Advisor's
 settings pages are all registered `-type fpdialog`. On this DE1app build,
 `dui page load` does not correctly exit an fpdialog page -- regardless of
 what name it is given (guessed or captured), it falls through to the app's
 plugin-loading resolver, which is what produces the `A_Flow` error. That
 mechanism simply does not transfer from GFC's page architecture to
-GrindAdvisor's.
+Grind Advisor's.
 
 This is the fourth navigation attempt (v1.8.3 crashed via a captured
 fallback, v1.8.4 silently no-op'd, v1.8.5 crashed on every press). Rather
@@ -895,7 +910,7 @@ semantics, or the v1.8.2 popup guards.
 
 Safety status: **no write behavior exists in this version.** No SDB or
 history-file code was touched; this pass only replaces the Done/Back
-navigation mechanism on every GrindAdvisor settings page.
+navigation mechanism on every Grind Advisor settings page.
 
 ### Comparative diagnosis
 
@@ -919,7 +934,7 @@ Reading its code in full:
 * **Catch blocks:** none around GFC's navigation call -- failures would
   surface visibly rather than being swallowed.
 
-GrindAdvisor's Done, by contrast, used `dui page close_dialog` (an
+Grind Advisor's Done, by contrast, used `dui page close_dialog` (an
 fpdialog-specific primitive GFC's plain pages never touch) and then layered
 recovery logic on top of it across three patches:
 
@@ -938,7 +953,7 @@ recovery logic on top of it across three patches:
   fpdialog-type page the wrong way -- apparently failed, and the failure
   was invisible: Done appeared to do nothing.
 
-**Root cause:** GrindAdvisor never adopted the one thing that makes GFC's
+**Root cause:** Grind Advisor never adopted the one thing that makes GFC's
 Done reliable -- a plain, unconditional `dui page load $return_page` call
 with no dialog-close call and no post-hoc filtering. Instead it kept patching
 around `dui page close_dialog`, and its final iteration hid the real error
@@ -987,7 +1002,7 @@ plugin-loading machinery (treating the unrecognized name as a plugin to
 enable). That machinery then tried to load an unrelated, already-installed
 plugin, `A_Flow` (apparently the first match it iterates to), which failed
 with "parent namespace doesn't exist" because nothing had actually asked for
-that plugin. GrindAdvisor's own sub-page Done buttons (`_close_subpage_dialog`)
+that plugin. Grind Advisor's own sub-page Done buttons (`_close_subpage_dialog`)
 were never affected because their fallback was already the literal static
 string `GrindAdvisor_settings`, never a captured value -- confirming the
 captured/computed page name was the defect, not the recovery mechanism
