@@ -1,6 +1,6 @@
-# Grind Advisor v3.6.2
+# Grind Advisor v3.6.3
 
-Current plugin version: **v3.6.2**.
+Current plugin version: **v3.6.3**.
 
 A DE1app (Decent Espresso) plugin. After every completed espresso shot it
 reads your latest shot from **SDB** and shows a popup recommending your next
@@ -359,12 +359,12 @@ the internal `page_stack` to a single entry whenever a normal (`default`
 type) page loads -- which is exactly what happens when a flush/rinse/steam
 flow screen appears -- even while an `fpdialog` settings page is open (the
 "only one dialog visible" guard only checks type `dialog`, not `fpdialog`).
-When the app re-shows GrindAdvisor's settings after the flow ends, the stack
+When the app re-shows Grind Advisor's settings after the flow ends, the stack
 reads `{flow_page, GrindAdvisor_settings}`, so `dui page close_dialog`
 "returns" to the flow page. That is the whole bug.
 
 The fix mirrors how Graphical_Flow_Calibrator survives the same scenario,
-adapted to fpdialog pages: every GrindAdvisor page's `show{}` callback
+adapted to fpdialog pages: every Grind Advisor page's `show{}` callback
 captures the real page it was opened from (ignoring machine-state flow pages
 so an interruption can never overwrite it), and Done navigates to that
 captured, existence-verified page via `dui page load` -- the same underlying
@@ -394,7 +394,7 @@ of guessing again.
 v1.8.5's fix crashed with the same DE1app "A_Flow" plugin-load error on
 *every* Done press, not just after a flush. Root cause: `dui page load`
 does not correctly exit an fpdialog-type page on this DE1app build --
-GrindAdvisor's settings pages are all `-type fpdialog`, while
+Grind Advisor's settings pages are all `-type fpdialog`, while
 Graphical_Flow_Calibrator's pages (whose pattern v1.8.5 copied) are plain
 top-level pages, so its `dui page load` approach doesn't transfer here.
 
