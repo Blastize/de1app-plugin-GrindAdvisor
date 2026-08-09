@@ -1,6 +1,48 @@
 # Grind Advisor — Changelog
 
-## v3.4.0 (Bag Stats page: per-bag R² and average)
+## v3.5.0 (Bag Stats becomes a bag comparison view) — TABLET-VERIFIED 2026-08-09
+
+Safety status: **no write behavior exists in this version.** Same read-only
+SDB fetch path as v3.4.0 (SELECTs only, 600-row window); everything on the
+page is display-only and nothing feeds back into any recommendation. Still
+the one written file, `last_recommendation.tdb`.
+
+### Bag Stats now answers "how did each bag behave?"
+
+Per the owner's goal (2026-08-09): fastest dial-in plus per-bag comparison.
+Backtesting (see v3.4.0's PROJECT_STATE notes) demoted R² — it gauges fit
+quality but predicts nothing — so each bag now shows the numbers that
+actually describe its behaviour:
+
+* **ideal** — the grind this bag's robust fit predicts for the target time
+  (clamped to the grinder range).
+* **slope** — the bean's seconds-per-grind from a **Theil–Sen** fit (median
+  of pairwise slopes, median-residual intercept), so one channeled shot
+  cannot drag it the way least-squares was dragged (Saraya: LS −26.2 vs
+  TS −19.4 s/grind on a 0.4 grind spread — both now correctly refused).
+* **drift** — s/day from a 3-parameter fit `t = b + m·grind + c·days`
+  (Cramer's rule), shown only with 6+ dated shots spanning 3+ days. This is
+  the backtest's real discovery (Pirates −1.6 s/day, R² 0.54→0.83): beans
+  speed up as the bag ages, which is why recommendations "chase" late-bag.
+* **on target in N shots** — first raw shot within ±2s of target.
+* **trust gate** — a bag needs 4+ eligible shots AND ≥1.0 grind spread AND
+  |slope| ≥ 0.5, else it shows "fit not reliable (reason)" instead of
+  numbers; shots all at one setting are arithmetic, not calibration.
+
+Header: median bean slope across reliable bags (the transferable number),
+plus the average R² retained as an overall gauge. New procs `_median`,
+`_theil_sen`, `_drift_fit`; `_bag_stats_text` rewritten; page geometry,
+navigation, and every other feature untouched.
+
+### Verified offline
+
+Whole file parses in tclsh; all new procs byte-compile; output exercised
+against the real tablet shots.db and cross-checked against the independent
+Python replication: Pirates ideal 8.9/slope −3.4/drift −1.6 s/day,
+Chelchele 7.2/−3.1/−0.8, Morgon 3.0/−2.2 — exact match; Saraya and
+LANGBIANG correctly gated as unreliable.
+
+## v3.4.0 (Bag Stats page: per-bag R² and average) — TABLET-VERIFIED 2026-08-09
 
 Safety status: **no write behavior exists in this version.** The new page is
 read-only and display-only: it reuses the existing read-only SDB fetch path

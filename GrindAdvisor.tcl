@@ -3414,12 +3414,17 @@ namespace eval ::plugins::GrindAdvisor {
     }
 
     # ------------------------------------------------------------------
-    #  Bag Stats (v3.4.0) -- READ-ONLY, display only. Groups recent valid
-    #  espresso shots by bag and reports each bag's calibration fit: the
-    #  same recency-weighted regression the forecast uses (t_norm vs
-    #  grind), its R2, learned slope and eligible shot count, plus the
-    #  average R2 across fitted bags. Nothing here feeds back into any
-    #  recommendation.
+    #  Bag Stats (v3.4.0; comparison view v3.5.0) -- READ-ONLY, display
+    #  only. Groups recent valid espresso shots by bag and reports how
+    #  each bag behaved, so bags can be compared: the ideal grind its
+    #  robust fit predicts for the target time, the bean's seconds-per-
+    #  grind slope (Theil-Sen: median of pairwise slopes, so one
+    #  channeled shot can't drag it), the time drift per day of bag life,
+    #  and how many shots it took to land within 2s of target. Average R²
+    #  stays in the header as an overall fit-quality gauge; per-bag trust
+    #  is judged by shot count and grind spread, because a fit through
+    #  shots at one grind setting is arithmetic, not calibration.
+    #  Nothing here feeds back into any recommendation.
     # ------------------------------------------------------------------
     proc _bag_date_short {raw} {
         set raw [string trim $raw]
@@ -3427,6 +3432,65 @@ namespace eval ::plugins::GrindAdvisor {
             if {![catch { clock format $raw -format "%d %b" } out]} { return $out }
         }
         return ""
+    }
+
+    proc _median {vals} {
+        set n [llength $vals]
+        if {$n == 0} { return "" }
+        set s [lsort -real $vals]
+        set mid [expr {$n / 2}]
+        if {$n % 2} { return [lindex $s $mid] }
+        return [expr {([lindex $s [expr {$mid - 1}]] + [lindex $s $mid]) / 2.0}]
+    }
+
+    # Robust line fit: median of pairwise slopes, median-residual intercept.
+    # pts = list of {grind time} pairs. Returns {m b} or "" when every shot
+    # sits at one grind.
+    proc _theil_sen {pts} {
+        set slopes {}
+        set n [llength $pts]
+        for {set i 0} {$i < $n} {incr i} {
+            lassign [lindex $pts $i] gi ti
+            for {set j [expr {$i + 1}]} {$j < $n} {incr j} {
+                lassign [lindex $pts $j] gj tj
+                if {abs($gj - $gi) < 1e-9} { continue }
+                lappend slopes [expr {($tj - $ti) / double($gj - $gi)}]
+            }
+        }
+        if {[llength $slopes] == 0} { return "" }
+        set m [_median $slopes]
+        set resid {}
+        foreach p $pts {
+            lassign $p g t
+            lappend resid [expr {$t - $m * $g}]
+        }
+        return [list $m [_median $resid]]
+    }
+
+    # Least-squares t = b + m*grind + c*days; returns the drift c (s/day)
+    # or "". pts = list of {grind days time}. Solved by Cramer's rule on
+    # the 3x3 normal equations.
+    proc _drift_fit {pts} {
+        if {[llength $pts] < 3} { return "" }
+        foreach v {a11 a12 a13 a22 a23 a33 b1 b2 b3} { set $v 0.0 }
+        foreach p $pts {
+            lassign $p g d t
+            set a11 [expr {$a11 + 1.0}]
+            set a12 [expr {$a12 + $g}]
+            set a13 [expr {$a13 + $d}]
+            set a22 [expr {$a22 + $g * $g}]
+            set a23 [expr {$a23 + $g * $d}]
+            set a33 [expr {$a33 + $d * $d}]
+            set b1 [expr {$b1 + $t}]
+            set b2 [expr {$b2 + $g * $t}]
+            set b3 [expr {$b3 + $d * $t}]
+        }
+        set det [expr {$a11*($a22*$a33 - $a23*$a23) - $a12*($a12*$a33 - $a23*$a13) \
+            + $a13*($a12*$a23 - $a22*$a13)}]
+        if {abs($det) < 1e-9} { return "" }
+        set detc [expr {$a11*($a22*$b3 - $b2*$a23) - $a12*($a12*$b3 - $b2*$a13) \
+            + $b1*($a12*$a23 - $a22*$a13)}]
+        return [expr {$detc / double($det)}]
     }
 
     proc _bag_stats_text {{max_bags 8}} {
@@ -3452,6 +3516,7 @@ namespace eval ::plugins::GrindAdvisor {
             dict lappend bagrows $k $r
         }
 
+        set target [_forecast_target]
         set entries {}
         set r2_sum 0.0
         set r2_count 0
@@ -3473,71 +3538,128 @@ namespace eval ::plugins::GrindAdvisor {
             }
             if {[llength $parts] > 0} { set label [join $parts " · "] }
 
-            # Eligible shots: outliers excluded, normalized time -- the exact
-            # dataset the forecast regression fits for this bag.
-            set shots {}
+            # Eligible shots (newest-first): outliers excluded, normalized
+            # time -- the exact dataset the forecast regression fits.
+            set pts {}
+            set draws {}
+            set traws {}
             set excluded 0
+            set t_first ""
             foreach r $brows {
                 if {[_is_outlier $r]} { incr excluded; continue }
                 lassign [_norm_time $r] tnorm active
                 if {$tnorm eq ""} { continue }
                 set sh [_shot_from_row $r]
                 if {[dict size $sh] == 0} { continue }
-                lappend shots [dict create grind [dict get $sh grind] \
-                    t_raw [dict get $sh duration] t_norm $tnorm norm_active $active]
-            }
-            set n [llength $shots]
-            set ex_txt [expr {$excluded > 0 ? ", $excluded excluded" : ""}]
-
-            # Date range from row timestamps (rows are newest-first).
-            set d_new [_bag_date_short [_dget $newest timestamp]]
-            set d_old [_bag_date_short [_dget [lindex $brows end] timestamp]]
-            set span ""
-            if {$d_old ne "" && $d_new ne ""} {
-                set span [expr {$d_old eq $d_new ? $d_new : "$d_old - $d_new"}]
-            }
-
-            set stat "R² n/a (needs 3+ shots)"
-            if {$n >= 3} {
-                set reg [_weighted_regression $shots 1]
-                if {[dict get $reg ok] && [dict get $reg r2] ne ""} {
-                    set r2 [dict get $reg r2]
-                    set m [dict get $reg m]
-                    set stat "R² [format %.2f $r2] · slope [format %.1f $m] s/grind"
-                    set r2_sum [expr {$r2_sum + $r2}]
-                    incr r2_count
-                    if {$r2 >= 0.5} { lappend slopes $m }
-                } else {
-                    set stat "R² n/a ([dict get $reg why])"
+                set g [dict get $sh grind]
+                lappend pts [list $g $tnorm]
+                lappend traws [dict get $sh duration]
+                set ts [_dget $r timestamp]
+                if {$ts ne "" && [string is integer -strict $ts]} {
+                    lappend draws [list $g $ts $tnorm]
+                    set t_first $ts
                 }
             }
+            set n [llength $pts]
+            set ex_txt [expr {$excluded > 0 ? ", $excluded excluded" : ""}]
+
+            # Grind spread and the average R² feed (same fit as v3.4.0).
+            set gmin ""; set gmax ""
+            foreach p $pts {
+                set g [lindex $p 0]
+                if {$gmin eq "" || $g < $gmin} { set gmin $g }
+                if {$gmax eq "" || $g > $gmax} { set gmax $g }
+            }
+            set spread [expr {$n > 0 ? $gmax - $gmin : 0.0}]
+            if {$n >= 3} {
+                set shots {}
+                foreach p $pts {
+                    lappend shots [dict create grind [lindex $p 0] \
+                        t_raw [lindex $p 1] t_norm [lindex $p 1] norm_active 0]
+                }
+                set reg [_weighted_regression $shots 1]
+                if {[dict get $reg ok] && [dict get $reg r2] ne ""} {
+                    set r2_sum [expr {$r2_sum + [dict get $reg r2]}]
+                    incr r2_count
+                }
+            }
+
+            # Shots-to-target: first raw shot time within 2s, oldest first.
+            set stt ""
+            set idx 0
+            foreach t [lreverse $traws] {
+                incr idx
+                if {abs($t - $target) <= 2.0} { set stt $idx; break }
+            }
+            if {$stt eq ""} {
+                set stt_txt "never within 2s"
+            } elseif {$stt == 1} {
+                set stt_txt "on target in 1 shot"
+            } else {
+                set stt_txt "on target in $stt shots"
+            }
+
+            # Robust per-bag calibration; trusted only with enough shots
+            # AND real grind spread.
+            set ts [_theil_sen $pts]
+            set trusted [expr {$n >= 4 && $spread >= 1.0 && $ts ne "" \
+                && abs([lindex $ts 0]) >= 0.5}]
+            if {$trusted} {
+                lassign $ts m b
+                set ideal [_clamp_grind [expr {($target - $b) / double($m)}]]
+                lappend slopes $m
+                set drift_txt ""
+                if {[llength $draws] >= 6 && $t_first ne ""} {
+                    set dpts {}
+                    set span_d 0.0
+                    foreach p $draws {
+                        lassign $p g ts2 t
+                        set d [expr {($ts2 - $t_first) / 86400.0}]
+                        if {$d > $span_d} { set span_d $d }
+                        lappend dpts [list $g $d $t]
+                    }
+                    if {$span_d >= 3.0} {
+                        set c [_drift_fit $dpts]
+                        if {$c ne ""} {
+                            set drift_txt " · drift [format %+.1f $c] s/day"
+                        }
+                    }
+                }
+                set stat "ideal [format %.1f $ideal] · slope [format %.1f $m] s/grind$drift_txt"
+            } else {
+                if {$n < 4} {
+                    set why "needs 4+ shots"
+                } elseif {$spread < 1.0} {
+                    set why "grind spread only [format %.1f $spread]"
+                } else {
+                    set why "slope too flat"
+                }
+                set stat "fit not reliable ($why)"
+            }
             set head "$shown) $label"
-            if {$span ne ""} { append head "  ($span)" }
+            if {$n > 0} {
+                set d_new [_bag_date_short [_dget $newest timestamp]]
+                set d_old [_bag_date_short [_dget [lindex $brows end] timestamp]]
+                if {$d_old ne "" && $d_new ne ""} {
+                    append head "  ([expr {$d_old eq $d_new ? $d_new : "$d_old - $d_new"}])"
+                }
+            }
             lappend entries $head
-            lappend entries "     $stat · $n shot(s)$ex_txt"
+            lappend entries "     $stat · $stt_txt · $n shots$ex_txt"
         }
 
         set lines {}
-        lappend lines "Latest $shown of [llength $order] bag(s) in the last [llength $rows] valid shots."
+        lappend lines "Latest $shown of [llength $order] bag(s) in the last [llength $rows] valid shots. Target [format %.0f $target]s."
+        if {[llength $slopes] > 0} {
+            lappend lines "Median bean slope: [format %.1f [_median $slopes]] s/grind (from [llength $slopes] reliable bag(s))."
+        }
         if {$r2_count > 0} {
             lappend lines "Average R²: [format %.2f [expr {$r2_sum / double($r2_count)}]] across $r2_count fitted bag(s)."
-        } else {
-            lappend lines "Average R²: n/a (no bag has 3+ eligible shots yet)."
-        }
-        if {[llength $slopes] > 0} {
-            set sorted [lsort -real $slopes]
-            set mid [expr {[llength $sorted] / 2}]
-            if {[llength $sorted] % 2} {
-                set med [lindex $sorted $mid]
-            } else {
-                set med [expr {([lindex $sorted [expr {$mid - 1}]] + [lindex $sorted $mid]) / 2.0}]
-            }
-            lappend lines "Typical bean slope: [format %.1f $med] s/grind (median of fits with R² >= 0.5)."
         }
         lappend lines ""
         lappend lines {*}$entries
         lappend lines ""
-        lappend lines "R² (0-1) is per bag: how much of that bag's shot-time variation the grind setting explains. Low values mean puck prep / channeling noise dominated, so grind recommendations converge slowly. The slope (seconds per grind step) is the number that carries between bags."
+        lappend lines "Ideal = the grind this bag's robust fit (median of pairwise slopes, so one channeled shot can't drag it) predicts for your target time. Slope = the bean's seconds per grind step. Drift = how shot time moved per day of bag life (shown with 6+ dated shots over 3+ days). A fit is only reliable with enough shots and grind spread; shots all at one setting can't calibrate. R² stays as an overall fit-quality gauge."
         return [join $lines "\n"]
     }
 }

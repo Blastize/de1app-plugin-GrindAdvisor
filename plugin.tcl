@@ -19,7 +19,7 @@ set plugin_name "GrindAdvisor"
 namespace eval ::plugins::GrindAdvisor {
     variable author      "Blastize"
     variable contact     "n/a"
-    variable version     "3.4.0"
+    variable version     "3.5.0"
     variable name        "Grind Advisor"
     variable description  "Reads your latest shot from SDB and recommends your next grind. Read-only, no manual entry."
 
