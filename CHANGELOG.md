@@ -1,5 +1,54 @@
 # Grind Advisor — Changelog
 
+## v3.6.0 (Bag Stats card list + Actions entry; long-text clipping fixed) — TABLET-VERIFIED 2026-08-09
+
+Safety status: **no write behavior exists in this version.** Read-only SDB
+access unchanged; all changes are display/navigation. Still the one written
+file, `last_recommendation.tdb`.
+
+### Bag Stats is now a card list, opened from Actions too
+
+Owner request: Bag Stats under Actions as well, and "similar to history,
+neatly in cards". Bag Stats now uses the **same overlay card-list mechanism
+as the History list** — 5 cards per page, ◀ Prev / Next ▶, Done — instead of
+a wall of text on a dui page:
+
+* card line 1 (bold): bean · roaster + first–last shot dates,
+* line 2: Ideal grind · Slope s/grind · Drift s/day (or "Fit not reliable
+  (reason)" when the v3.5.0 trust gate fails),
+* line 3 (muted): On target in N shots · shot count, outliers excluded,
+* header: summary line (target, median slope over reliable bags, average
+  R²), toolbar count "Bags 1–5 of N".
+* Now lists up to 25 bags (5 pages) instead of 8.
+
+Opened from **both** the main page's Actions card (new third button; the
+card grew one row) and Advanced → Tools (same slot as before). The old
+`GrindAdvisor_bag_stats` dui page, its registration, and `_bag_stats_text`
+are removed — the data logic moved intact into `_bag_cards_data`, and the
+overlay procs (`show_bag_stats`, `_bag_page`, `_render_bag_stats_dialog`)
+mirror the History dialog's structure verbatim.
+
+### Long text no longer clips (Help, Calculation Details, Diagnostics)
+
+Owner-reported bug: Help / Guide and Calculation Details ran past the card
+and clipped under the bottom bar. Fix: `_paginate_text` splits content on
+newlines, charges each line its estimated wrapped-line count, and packs
+conservative pages (19 body lines / 23 caption lines); a shared
+`_add_pager` puts ◀ Prev / Next ▶ plus a "Page 1 / N" indicator in the
+bottom bar of all three text pages. Single-page content shows no indicator
+and the buttons no-op. Glyphs use the proven `[format %c 0x25C0]` pattern.
+
+### Verified offline
+
+Whole file parses; `_bag_cards_data` exercised against the real tablet
+shots.db (9 bags render, numbers identical to v3.5.0's — Pirates ideal
+8.9 / slope −3.4 / drift −1.6 s/day); `_paginate_text` unit-checked
+(short → 1 page, 50 lines → 3+, wrapped-line costing); every new/changed
+proc byte-compiles, including all three paginated page namespaces and the
+reworked settings/advanced setups. Geometry re-checked from the token
+math: Actions card now ends at y=1384 (48 above the bottom bar), all
+other pages unchanged or verified.
+
 ## v3.5.0 (Bag Stats becomes a bag comparison view) — TABLET-VERIFIED 2026-08-09
 
 Safety status: **no write behavior exists in this version.** Same read-only
