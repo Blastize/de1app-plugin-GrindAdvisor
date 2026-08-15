@@ -1,32 +1,12 @@
-# Grind Advisor v3.8.0
+# Grind Advisor
 
-Current plugin version: **v3.6.3**.
+Current plugin version: **v3.8.1**.
 
 A DE1app (Decent Espresso) plugin. After every completed espresso shot it
 reads your latest shot from **SDB** and shows a popup recommending your next
 grind setting. You enter nothing by hand.
 
-```
-┌───────────────────────────────────┐
-│            ✓ Shot Saved           │
-│                                   │
-│           13.5 → 13.0             │
-│           coarser by 0.5          │
-│                                   │
-│   Time        26.8s (target 28s)  │
-│   Dose        18.0g               │
-│   Yield       36.0g               │
-│   Ratio       1:2.0               │
-│   Bag Shot    #6                  │
-│                                   │
-│   Reason                          │
-│   Regression over 6 shots (slope  │
-│   -4.1 s/grind, predicts 28.0s    │
-│   at 13.0).                       │
-│                                   │
-│ [ OK ] [ Why? ] [ Curve ] [ Hist ]│
-└───────────────────────────────────┘
-```
+![The after-shot popup](images/shot-analysis-popup.jpg)
 
 Dose, Yield, and Ratio lines appear automatically when those columns exist in
 SDB; if they aren't stored, those lines are simply omitted.
@@ -36,30 +16,7 @@ SDB; if they aren't stored, those lines are simply omitted.
 **Curve** shows what the recommendation is actually standing on. **Back**
 returns to the popup.
 
-```
-┌─────────────────────────────────────────┐
-│           Calibration Curve             │
-│  30 ┃  ·                                │
-│     ┃╲   ·        ┆      target 28s     │
-│  ‥‥‥┃‥‥╲‥‥‥‥‥‥‥‥‥‥┆‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥ │
-│     ┃    ╲ ·   ·  ┆                     │
-│  22 ┗━┿━━━━┿━━━━┿━━━━┿━━━━┿━━━━┿━━━━━━  │
-│     time (normalized), s                │
-│ +1.2┃ ┆    ┆  │ ┆    ┆ │  ┆             │
-│   0 ┠─┼────┼──┬─┼────┼─┴──┼─────────    │
-│     ┃ ┆    ┆  │ ┆    ┆    ┆             │
-│       8   8.5  9   9.5  10   10.5       │
-│     residuals, s        grind setting → │
-│                                         │
-│  R² 0.996  ·  bias +0.01s  ·  spread    │
-│  ±0.09s  ·  n=6                         │
-│  Residuals are small and evenly spread  │
-│  about the line: this calibration is    │
-│  behaving.                              │
-│                                         │
-│      [ Back ]           [ OK ]          │
-└─────────────────────────────────────────┘
-```
+![The Calibration Curve](images/calibration-curve.jpg)
 
 * **Top panel** — every eligible shot on the current bag, the line the model
   solved, a dashed guide at your target time, and a labelled dashed vertical
@@ -304,6 +261,12 @@ lands, so this is safe to call from a refresh path that runs every 200 ms.
 A bag with no shots still returns nothing — no invented starting grind.
 
 ## Settings
+
+![The settings page](images/settings-page.jpg)
+
+Target shot time, grinder range and rounding live on the main page, with the
+Calibration Accuracy gauge beside them; **Advanced** holds the diagnostics,
+Bag Stats and the dose/yield source mode.
 
 Defaults live in `plugin.tcl` under `::plugins::GrindAdvisor::settings`:
 
