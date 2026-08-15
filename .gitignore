@@ -25,6 +25,11 @@ delete_log.txt
 # Version archives
 *Archive/
 
+# Internal working notes -- kept local, never published. They record tablet
+# and network details (device address, local paths) that have no place in a
+# public repo, and nothing in the plugin needs them at runtime.
+PROJECT_STATE.md
+
 # OS junk
 desktop.ini
 Thumbs.db
