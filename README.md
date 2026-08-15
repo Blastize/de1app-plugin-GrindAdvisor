@@ -1,4 +1,4 @@
-# Grind Advisor v3.6.3
+# Grind Advisor v3.8.0
 
 Current plugin version: **v3.6.3**.
 
@@ -6,7 +6,27 @@ A DE1app (Decent Espresso) plugin. After every completed espresso shot it
 reads your latest shot from **SDB** and shows a popup recommending your next
 grind setting. You enter nothing by hand.
 
-<img src="images/shot-analysis-popup.jpg" alt="Grind Advisor after-shot popup" width="620">
+```
+┌───────────────────────────────────┐
+│            ✓ Shot Saved           │
+│                                   │
+│           13.5 → 13.0             │
+│           coarser by 0.5          │
+│                                   │
+│   Time        26.8s (target 28s)  │
+│   Dose        18.0g               │
+│   Yield       36.0g               │
+│   Ratio       1:2.0               │
+│   Bag Shot    #6                  │
+│                                   │
+│   Reason                          │
+│   Regression over 6 shots (slope  │
+│   -4.1 s/grind, predicts 28.0s    │
+│   at 13.0).                       │
+│                                   │
+│ [ OK ] [ Why? ] [ Curve ] [ Hist ]│
+└───────────────────────────────────┘
+```
 
 Dose, Yield, and Ratio lines appear automatically when those columns exist in
 SDB; if they aren't stored, those lines are simply omitted.
@@ -16,7 +36,30 @@ SDB; if they aren't stored, those lines are simply omitted.
 **Curve** shows what the recommendation is actually standing on. **Back**
 returns to the popup.
 
-<img src="images/calibration-curve.jpg" alt="Calibration Curve view" width="740">
+```
+┌─────────────────────────────────────────┐
+│           Calibration Curve             │
+│  30 ┃  ·                                │
+│     ┃╲   ·        ┆      target 28s     │
+│  ‥‥‥┃‥‥╲‥‥‥‥‥‥‥‥‥‥┆‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥ │
+│     ┃    ╲ ·   ·  ┆                     │
+│  22 ┗━┿━━━━┿━━━━┿━━━━┿━━━━┿━━━━┿━━━━━━  │
+│     time (normalized), s                │
+│ +1.2┃ ┆    ┆  │ ┆    ┆ │  ┆             │
+│   0 ┠─┼────┼──┬─┼────┼─┴──┼─────────    │
+│     ┃ ┆    ┆  │ ┆    ┆    ┆             │
+│       8   8.5  9   9.5  10   10.5       │
+│     residuals, s        grind setting → │
+│                                         │
+│  R² 0.996  ·  bias +0.01s  ·  spread    │
+│  ±0.09s  ·  n=6                         │
+│  Residuals are small and evenly spread  │
+│  about the line: this calibration is    │
+│  behaving.                              │
+│                                         │
+│      [ Back ]           [ OK ]          │
+└─────────────────────────────────────────┘
+```
 
 * **Top panel** — every eligible shot on the current bag, the line the model
   solved, a dashed guide at your target time, and a labelled dashed vertical
@@ -193,9 +236,74 @@ this is where to look:
   (`shot_history`, `history_viewer`, `DSx_past`, …). If yours differs, set the
   right page name in `_open_history` in `GrindAdvisor.tcl`.
 
-## Settings
+## What counts as "the same bag" (v3.7.0)
 
-<img src="images/settings-page.jpg" alt="Grind Advisor settings page" width="740">
+Calibration is per bag: the ladder counts only shots on the bag you are pulling
+now, and resets when you change bag. From v3.7.0 the **profile** is part of that
+identity — switching profile starts a fresh calibration, exactly like opening a
+new bag, because a different profile is a different extraction and old shots are
+not evidence about it.
+
+The key is bean · roaster · origin · roast date · profile, lowercased. A profile
+on its own never forms a key: with no bean fields set there is no bag identity
+to speak of, and treating the profile as one would make every shot on such a
+machine look like the same bag.
+
+Set `segment_by_profile` to 0 to go back to bag-only identity.
+
+**On the evidence for this:** replaying the engine over the author's history
+gives the same segments and the same ideal grinds either way — it changes
+nothing about shots already recorded, so there is no regression risk, and
+equally no backward validation. It matters going forward, when the *same* bag is
+run on two profiles.
+
+### For skin authors
+
+A skin that reads `::plugins::GrindAdvisor::last_recommendation` directly should
+check it still applies before showing the number:
+
+```tcl
+if { [::plugins::GrindAdvisor::last_recommendation_is_current] } {
+    # show the recommended grind
+} else {
+    # show [::plugins::GrindAdvisor::new_bag_note] instead
+}
+```
+
+`current_bag_key` returns the key for whatever is loaded right now. Neither proc
+opens the database or touches the filesystem, so both are safe to call from a
+refresh path that runs every 200 ms. Both fail safe: when identity cannot be
+determined (a recommendation saved before v3.7.0, or a machine with no bean
+fields) `last_recommendation_is_current` returns 1, so a usable number is never
+blanked by accident.
+
+Recommendations now also carry `bag_key`, `bag_label` and `profile`. These are
+identity and display only — no recommendation math reads them back.
+
+### Per-bag recommendations (v3.8.0)
+
+Better than blanking: ask for the recommendation belonging to whatever bag is
+loaded, computed from that bag's own shots.
+
+```tcl
+set rec [::plugins::GrindAdvisor::recommendation_for_current_bag]
+if { $rec eq "" } {
+    # this bag has no shots yet -- show new_bag_note
+} else {
+    # show it exactly like a normal recommendation
+}
+```
+
+It prefers the saved recommendation when that already describes the loaded bag
+(freshest — it came from the shot just pulled) and otherwise computes.
+`recommendation_for_bag {bag_key}` does one specific bag.
+
+Results are memoized per bag and the cache is dropped whenever a new shot
+lands, so this is safe to call from a refresh path that runs every 200 ms.
+
+A bag with no shots still returns nothing — no invented starting grind.
+
+## Settings
 
 Defaults live in `plugin.tcl` under `::plugins::GrindAdvisor::settings`:
 
@@ -210,6 +318,7 @@ Defaults live in `plugin.tcl` under `::plugins::GrindAdvisor::settings`:
 | `popup_font_scale`         | 1.0     | multiplier if text looks too big/small   |
 | `enable_popup`             | 1       | automatic popup after completed shots    |
 | `dose_yield_mode`          | auto    | which dose/yield to report: fixed/actual/auto |
+| `segment_by_profile`       | 1       | treat a profile change like a new bag (v3.7.0) |
 
 The Regression Forecast method has no tuning knobs — its constants (3.0 s/step
 default, 0.5 damping, 0.85 recency decay, 1.8 s/g dose sensitivity, 2.0 g
