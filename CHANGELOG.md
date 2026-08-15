@@ -1,5 +1,178 @@
 # Grind Advisor — Changelog
 
+## v3.8.1 (fix: a keyless saved recommendation masked every per-bag answer) — 2026-08-15
+
+Safety status: read-only, unchanged.
+
+Owner-reported from the tablet: cycling bags still did not change the
+recommended grind. v3.8.0's `recommendation_for_current_bag` opened with
+
+```tcl
+if {[last_recommendation_is_current]} { return $last_recommendation }
+```
+
+and `last_recommendation_is_current` **fails safe by answering "current"
+whenever bag identity is unknown**. That is right for the question it was
+written for — *"should the tile blank?"* — and exactly wrong for *"should I
+bother computing?"*. A recommendation saved before v3.7.0 carries no
+`bag_key`, so it claimed to match every bag and the same number came back
+forever, which is precisely what the tablet showed.
+
+The saved recommendation is now preferred only on a **positive** match: a
+non-empty current key AND a stored `bag_key` equal to it. Otherwise the bag's
+own recommendation is computed. With no bean identity at all there is no
+per-bag answer to be had, so the saved rec is still the fallback rather than
+blanking a machine with no bean fields filled in.
+
+Regression test added: a keyless saved rec must not mask the per-bag answer,
+and cycling between two bags must change the number.
+
+## v3.8.0 (per-bag recommendations) — NOT YET TABLET-VERIFIED, 2026-08-15
+
+Safety status: **still read-only. No write behavior is added.** SDB is opened
+read-only and only `SELECT`s are run; nothing in `history/` or `history_v2/`
+is read, written, renamed or deleted. The only file written remains
+`last_recommendation.tdb`, unchanged in shape from v3.7.0.
+
+### The card now knows what to say about a bag you switch back to
+
+v3.7.0 let a skin detect that the saved recommendation belonged to a different
+bag — but that was only half a solution, because the tile then went blank. A
+bag you switch back to already has its own shots and its own regression, so
+blanking threw away a recommendation the data fully supports.
+
+`recommendation_for_bag {bag_key}` computes for any bag, from that bag's own
+shots, by running the **same engine at that bag's most recent shot** instead of
+the newest shot overall. No math is duplicated: `_forecast_rec` already takes a
+position and `_bag_forecast_shots` already filters same-bag from it.
+
+Against the real history this produces, for each bag: Morgon 4.4, Pirates 8.9,
+Chelchele 7.3, JIVA Colombia 12.7 and 10.3, Saraya 8.2 — every one from a
+regression over that bag's own shots.
+
+This does **not** contradict the owner's "reset only, no seeded number"
+decision (2026-08-15). That governs a bag with NO history, which still returns
+nothing here. This only ever shows numbers a bag's own shots justify.
+
+`recommendation_for_current_bag` prefers the saved recommendation when it
+already describes the loaded bag — that is the freshest possible answer, since
+it was computed from the shot just pulled — and otherwise computes.
+
+### Decoration was extracted, not duplicated
+
+Everything the popup shows beyond the bare forecast (bag shot number, channel
+warning, confidence, identity, dose/yield source, stable id) moved from
+`analyze_latest_shot` into `_decorate_rec {rec rows fields pos}`, so a per-bag
+rec is decorated identically. A second copy would have drifted the moment
+either changed.
+
+Two call sites became position-relative (`_channel_warning` start and the row
+slice handed to `_calibration_confidence`). At `pos` 0 both reduce to exactly
+the previous values, and the harness asserts that `analyze_latest_shot` returns
+a result **identical** to a direct `_decorate_rec` at position 0.
+
+### Caching
+
+The skin's grind tile is re-evaluated on the app's update tick (~200 ms), so an
+uncached lookup would mean reopening SDB and re-running the engine several
+times a second. Results are memoized per bag key, and the whole cache is
+dropped in `save_last_recommendation` — the single point where a new shot
+exists — so a fresh shot can never be masked by a stale cached rec. Only
+successful lookups are cached; caching a failure would keep returning nothing
+after a transient database problem had cleared.
+
+Verified offline: all changed procs byte-compile; per-bag selection, the
+decoration set, cache hit/miss, invalidation on a new shot, unknown bag, empty
+key, and both branches of `recommendation_for_current_bag` all pass; the
+per-bag numbers were cross-checked against the real `shots.db` by an
+independent Python replication.
+
+## v3.7.0 (profile-aware calibration; bag identity on the recommendation) — NOT YET TABLET-VERIFIED, 2026-08-15
+
+Safety status: **still read-only. No write behavior is added in this version.**
+The plugin opens SDB read-only and runs only `SELECT`s; it never writes, moves,
+renames or deletes anything in `history/`, `history_v2/` or SDB. The only file
+it writes remains its own `last_recommendation.tdb`, which gains three small
+identity fields (`bag_key`, `bag_label`, `profile`) and no new write path.
+
+### Profile is part of the calibration key
+
+Switching profile now starts a fresh calibration, exactly like opening a new
+bag — a different profile is a different extraction, so earlier shots are not
+evidence about it. The key is bean · roaster · origin · roast date · profile.
+
+A profile on its own never forms a key: with no bean fields there is no bag
+identity, and treating the profile as one would make every shot on such a
+machine look like one endless bag.
+
+New setting `segment_by_profile` (default 1) turns it off without a code change.
+
+**Be honest about the evidence for this, and do not let it drift into folklore.**
+Replaying the real engine over the author's history produces **7 segments either
+way, with identical ideal grinds**. It changes nothing about any shot on record.
+The two JIVA "Origin Colombia" bags that look like a profile-driven 10.2 / 12.7
+split were **already separate bags** — their `roast_date` differs (one empty, one
+`19.09.2025`) — so they are not evidence for profile segmentation. This is a
+forward-looking feature with no backward validation, and correspondingly no
+regression risk. Verified in the offline harness: with `segment_by_profile` 0 the
+key is byte-identical to v3.6.3's for every case tested, including whitespace
+and empty-field edge cases.
+
+### Recommendations know which bag they are about
+
+`_forecast_rec` attaches `bag_key`; `analyze_latest_shot` adds `bag_label` and
+`profile`. Identity and display only — no recommendation math reads them back.
+
+This fixes a real bug in skin integration: Lumen's grind tile reads
+`last_recommendation` directly, and because the recommendation carried no bag
+identity, switching bags left the **previous** bag's number on screen until the
+next shot was pulled.
+
+Two public procs for skins, neither of which opens the database or touches the
+filesystem (safe to call from a 200 ms refresh path):
+
+* `current_bag_key` — the key for whatever is loaded right now, built from live
+  `::settings` through the *detected* column names cached by
+  `_resolve_bag_fields`, so it can never normalize differently from the key
+  built from a stored row. The harness checks this equivalence directly; if the
+  two ever diverged, a skin would treat every recommendation as stale.
+* `last_recommendation_is_current` — 1 when the saved recommendation is about
+  the loaded bag and profile. **Fails safe:** a recommendation saved before
+  v3.7.0 has no key, and a machine with no bean fields yields an empty key; in
+  both cases it returns 1 rather than blanking a usable number.
+
+`show_last_recommendation` now refuses to present a recommendation belonging to
+a different bag, saying which bag it was for instead. Per the owner's decision
+(2026-08-15) this is **reset only** — no seeded or guessed grind for a new bag,
+and the grinder is left where it is.
+
+### Shot window 40 → 200 rows
+
+The window must reach far enough back to hold every shot of the current bag, and
+with several bags in rotation those shots are interleaved with other bags'.
+Measured on the real history: the deepest single-bag span is 13 shots, so a
+3-bag rotation spans ~39 rows and a 5-bag one ~65 — and on a machine where
+rinses and flushes are not purged they consume the same limit (the SQL filters
+`removed=1`, not rinses). 40 was tight for two bags and short for three.
+
+Cost measured against the real 1071-row database: `LIMIT 40` = 0.20 ms,
+`LIMIT 200` = 0.34 ms. Bag Stats already runs 600 on every open. Applied at both
+call sites (the recommendation path and the Calibration Accuracy gauge, which
+counts same-bag shots and had the same problem) via one `GA_FETCH_LIMIT`
+constant instead of two hardcoded 40s.
+
+### Bag Stats labels
+
+Cards are labelled through the new shared `_bag_label`, which appends the
+profile when segmentation is on. Without this, one bean run on two profiles
+renders as two identical-looking cards.
+
+### Diagnostics
+
+Now reports the detected profile column, whether segmentation is on, the current
+bag key, the saved recommendation's key with a `(matches current)` /
+`(STALE …)` verdict, and the shot window size — so none of this is silent.
+
 ## v3.6.3 (display-name consistency: "Grind Advisor" in all prose) — docs only, 2026-08-10
 
 Safety status: **no write behavior exists in this version.** Docs-only pass;

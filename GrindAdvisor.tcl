@@ -54,6 +54,10 @@ namespace eval ::plugins::GrindAdvisor {
 
     variable last_recommendation {}
 
+    # Field -> SDB column mapping for the bag fields, cached by
+    # _resolve_bag_fields so current_bag_key never has to open the database.
+    variable bag_field_cols {}
+
     # v1.8.2 guard state: popup re-entry flag and navigation-watch installer.
     variable popup_active 0
     variable nav_watched  0
@@ -93,6 +97,7 @@ namespace eval ::plugins::GrindAdvisor {
             dose_max                 22.0
             ratio_min                1.0
             ratio_max                4.0
+            segment_by_profile       1
         } {
             if {![info exists settings($k)]} { set settings($k) $v }
         }
@@ -355,6 +360,22 @@ namespace eval ::plugins::GrindAdvisor {
             present_result [dict create ok 0 error "No saved Grind Advisor recommendation yet."]
             return
         }
+        # v3.7.0: the saved recommendation is about a specific bag and
+        # profile. If the user has switched since, presenting that number
+        # would be actively misleading -- it is a calibration for a different
+        # coffee. Say so instead of showing it. Owner decision (2026-08-15):
+        # reset only, never seed a guessed grind for a new bag.
+        if {![last_recommendation_is_current]} {
+            set was ""
+            if {[dict exists $last_recommendation bag_label]} {
+                set was [string trim [dict get $last_recommendation bag_label]]
+            }
+            set detail "The saved recommendation is for a different bag or profile."
+            if {$was ne ""} { set detail "The saved recommendation is for $was." }
+            present_result [dict create ok 0 error \
+                "[new_bag_note].\n\n$detail"]
+            return
+        }
         present_result $last_recommendation
     }
 
@@ -446,6 +467,11 @@ namespace eval ::plugins::GrindAdvisor {
         variable last_recommendation
         if {![dict exists $rec ok] || ![dict get $rec ok]} { return }
         set last_recommendation $rec
+        # A new shot exists, so every cached per-bag recommendation is now
+        # potentially out of date -- including the one for THIS bag, which
+        # this shot has just changed. Dropping the whole cache here is the
+        # single invalidation point (v3.8.0); the next lookup recomputes.
+        invalidate_bag_rec_cache
         set fn [_last_recommendation_file]
         if {[catch {
             set f [open $fn w]
@@ -991,9 +1017,10 @@ namespace eval ::plugins::GrindAdvisor {
     # Fresh score for the settings page (read-only SELECT, same pipeline
     # every other consumer uses).
     proc calibration_confidence {} {
+        variable GA_FETCH_LIMIT
         lassign [locate_shot_source] db table fields
         if {$db eq "" || $table eq ""} { return [dict create ok 0] }
-        set rows [_fetch_recent $db $table $fields 40]
+        set rows [_fetch_recent $db $table $fields $GA_FETCH_LIMIT]
         set rows [_filter_valid_rows $rows $fields]
         return [_calibration_confidence $rows]
     }
@@ -1116,13 +1143,14 @@ namespace eval ::plugins::GrindAdvisor {
     }
 
     proc analyze_latest_shot {} {
+        variable GA_FETCH_LIMIT
         lassign [locate_shot_source] db table fields
         if {$db eq "" || $table eq ""} {
             return [dict create ok 0 error \
                 "Couldn't find a usable shot table in SDB.\nNeed columns for grind and shot time."]
         }
 
-        set rows [_fetch_recent $db $table $fields 40]
+        set rows [_fetch_recent $db $table $fields $GA_FETCH_LIMIT]
         if {[llength $rows] == 0} {
             return [dict create ok 0 error \
                 "No saved shots found in SDB yet.\nPull a shot, then try again."]
@@ -1152,21 +1180,47 @@ namespace eval ::plugins::GrindAdvisor {
                 "Latest shot is missing a numeric grind or time value."]
         }
 
+        return [_decorate_rec $rec $rows $fields 0]
+    }
+
+    # Everything the popup and the skin show beyond the bare forecast:
+    # bag shot number, channel warning, confidence, identity, dose/yield
+    # source and the stable id.
+    #
+    # v3.8.0 lifted this out of analyze_latest_shot unchanged so
+    # recommendation_for_bag can produce a rec that is decorated identically.
+    # Splitting it was the alternative to duplicating it, and a second copy
+    # would have drifted the moment either changed.
+    #
+    # `pos` is the row the recommendation is about -- 0 for the latest shot,
+    # or the newest row of a chosen bag.
+    proc _decorate_rec {rec rows fields pos} {
+        set cur     [lindex $rows $pos]
+        set current [_shot_from_row $cur]
+
         # Bag shot number and channel warning are display extras.
-        set bag_shot [_bag_shot_count $current $rows 0]
+        set bag_shot [_bag_shot_count $current $rows $pos]
         if {$bag_shot ne ""} { dict set rec bag_shot $bag_shot }
-        set channel_warning [_channel_warning $current $rows 1]
+        set channel_warning [_channel_warning $current $rows [expr {$pos + 1}]]
         if {$channel_warning ne ""} { dict set rec channel_warning $channel_warning }
 
         # Display-only calibration confidence (v2.1.0); attached after the
         # recommendation is fully computed so it can never influence it.
-        set conf [_calibration_confidence $rows]
+        set conf [_calibration_confidence [lrange $rows $pos end]]
         if {[dict get $conf ok]} {
             dict set rec confidence [dict get $conf score]
             dict set rec confidence_band [dict get $conf band]
         }
 
         dict set rec timestamp [_dget $cur timestamp]
+
+        # v3.7.0: stamp the recommendation with WHICH bag and profile it is
+        # about, so a skin can tell a live number from a stale one after the
+        # user switches bags. Display/identity only -- never read back by any
+        # math. bag_key comes from _shot_from_row via _forecast_rec.
+        dict set rec bag_label [_bag_label $cur]
+        dict set rec profile [string trim [_dget $cur profile]]
+        dict set rec segment_by_profile [_segment_by_profile]
 
         # Display extras (shown only when present in SDB). Dose and yield come
         # from the source-mode resolver (v2.3.0), so the popup reports the
@@ -1216,13 +1270,36 @@ namespace eval ::plugins::GrindAdvisor {
         return $shot
     }
 
-    proc _bag_key {row} {
-        if {![dict exists $row bag_values]} { return "" }
-        set vals [dict get $row bag_values]
+    # v3.7.0: the calibration key gained the profile.
+    #
+    # Changing profile changes the extraction, so shots taken on a different
+    # profile are not evidence about the current one -- the ladder must start
+    # fresh, exactly as it does for a new bag. Owner decision, 2026-08-15.
+    #
+    # HONEST NOTE ON EVIDENCE, so nobody over-claims this later: replaying the
+    # real engine over the tablet's history produces **7 segments either way
+    # and identical ideal grinds**. This changes nothing about any shot on
+    # record. The two JIVA "Origin Colombia" bags that look like a
+    # profile-driven 10.2 / 12.7 split were ALREADY separate bags -- their
+    # roast_date differs (one empty, one 19.09.2025). So this is a
+    # forward-looking feature with zero backward validation, and equally with
+    # zero regression risk. Do not cite the JIVA bags as proof it works.
+    #
+    # Gated by the `segment_by_profile` setting (default on) so it can be
+    # turned off without a code change if fragmenting turns out to hurt.
+    proc _segment_by_profile {} {
+        set v [_setting segment_by_profile 1]
+        if {![string is boolean -strict $v]} { return 1 }
+        return [expr {$v ? 1 : 0}]
+    }
+
+    # Lowercase, trim, drop empties, join. Shared by the row-built key and the
+    # live-settings key so the two can never normalize differently -- if they
+    # did, the skin would see every recommendation as stale.
+    proc _normalize_key_parts {vals} {
         set parts {}
-        foreach field {bean roaster origin roast_date} {
-            if {![dict exists $vals $field]} { continue }
-            set v [string trim [dict get $vals $field]]
+        foreach v $vals {
+            set v [string trim $v]
             if {$v eq ""} { continue }
             lappend parts [string tolower $v]
         }
@@ -1230,11 +1307,227 @@ namespace eval ::plugins::GrindAdvisor {
         return [join $parts "|"]
     }
 
+    # Builds the key from bag values + a profile title. Profile is appended
+    # only when there is already bean identity: a profile on its own is not a
+    # bag, and treating it as one would make every shot on a machine with no
+    # bean fields look like the same "bag".
+    proc _compose_bag_key {bag_values profile} {
+        set vals {}
+        foreach field {bean roaster origin roast_date} {
+            if {[dict exists $bag_values $field]} {
+                lappend vals [dict get $bag_values $field]
+            }
+        }
+        set base [_normalize_key_parts $vals]
+        if {$base eq ""} { return "" }
+        if {[_segment_by_profile]} {
+            set p [_normalize_key_parts [list $profile]]
+            if {$p ne ""} { append base "|" $p }
+        }
+        return $base
+    }
+
+    proc _bag_key {row} {
+        if {![dict exists $row bag_values]} { return "" }
+        return [_compose_bag_key [dict get $row bag_values] [_dget $row profile]]
+    }
+
     proc _same_bag {current shot} {
         if {![dict exists $current bag_key] || ![dict exists $shot bag_key]} {
             return 0
         }
         return [expr {[dict get $current bag_key] eq [dict get $shot bag_key]}]
+    }
+
+    # Human-readable bag name for a row: bean, then roaster. The profile is
+    # appended when it is part of the key, otherwise two segments of the same
+    # bean render as identical-looking duplicates in Bag Stats.
+    proc _bag_label {row} {
+        set bv [expr {[dict exists $row bag_values] ? [dict get $row bag_values] : {}}]
+        set parts {}
+        foreach f {bean roaster} {
+            set v [string trim [_dget $bv $f]]
+            if {$v ne ""} { lappend parts $v }
+        }
+        set label [join $parts " · "]
+        if {[_segment_by_profile]} {
+            set p [string trim [_dget $row profile]]
+            if {$p ne ""} {
+                if {$label eq ""} { return $p }
+                append label " — $p"
+            }
+        }
+        return $label
+    }
+
+    # ==================================================================
+    #  Public API for skins (v3.7.0)
+    #
+    #  Lumen's grind tile reads ::plugins::GrindAdvisor::last_recommendation
+    #  directly. Before 3.7.0 the rec carried no bag identity, so after the
+    #  user switched bags the tile kept showing the PREVIOUS bag's number
+    #  until the next shot was pulled. These two procs let a skin ask
+    #  "is what I am holding still about the bag that is loaded now?".
+    #
+    #  Neither opens the database or touches the filesystem: they are safe to
+    #  call from a UI refresh path that runs every 200 ms.
+    # ==================================================================
+
+    # The bag columns to read out of ::settings. Uses the mapping cached by
+    # _resolve_bag_fields when an analysis has already run this session;
+    # otherwise falls back to the core's own metadata names, which is what
+    # shot.tcl writes into every shot file and therefore what SDB's columns
+    # are called (de1app-core/app_metadata.tcl).
+    proc _current_bag_cols {} {
+        variable bag_field_cols
+        if {[dict size $bag_field_cols] > 0} { return $bag_field_cols }
+        return [dict create bean bean_type roaster bean_brand roast_date roast_date]
+    }
+
+    # The calibration key for what is loaded RIGHT NOW, built from the live
+    # ::settings the way a shot pulled this instant would be recorded.
+    proc current_bag_key {} {
+        set bv {}
+        dict for {field col} [_current_bag_cols] {
+            set v ""
+            catch {
+                if {[info exists ::settings($col)]} { set v $::settings($col) }
+            }
+            dict set bv $field $v
+        }
+        set profile ""
+        catch {
+            if {[info exists ::settings(profile_title)]} {
+                set profile $::settings(profile_title)
+            }
+        }
+        return [_compose_bag_key $bv $profile]
+    }
+
+    # 1 when the saved recommendation describes the currently loaded bag and
+    # profile, 0 when the user has switched and no shot has been pulled yet.
+    #
+    # Deliberately fails SAFE: a recommendation saved before 3.7.0 has no
+    # bag_key, and a machine with no bean fields produces an empty key. In
+    # both cases we cannot tell, and returning 1 keeps a usable number on
+    # screen rather than blanking the tile for everyone on older data.
+    proc last_recommendation_is_current {} {
+        variable last_recommendation
+        if {![dict exists $last_recommendation bag_key]} { return 1 }
+        set rk [dict get $last_recommendation bag_key]
+        set ck [current_bag_key]
+        if {$rk eq "" || $ck eq ""} { return 1 }
+        return [expr {$rk eq $ck}]
+    }
+
+    # What the skin shows when a bag has no shots to calibrate from.
+    proc new_bag_note {} {
+        return "New bag - pull a shot to calibrate"
+    }
+
+    # ==================================================================
+    #  Per-bag recommendations (v3.8.0)
+    #
+    #  v3.7.0 let a skin detect that the saved recommendation belonged to a
+    #  different bag. That was half a solution: the tile went blank. But a bag
+    #  you switch BACK to already has its own shots and its own regression, so
+    #  blanking throws away a recommendation the data fully supports.
+    #
+    #  This computes the recommendation for any bag, from that bag's own
+    #  shots, by running the EXACT same engine at that bag's most recent shot
+    #  instead of the newest shot overall. No math is duplicated:
+    #  _forecast_rec already takes a position and _bag_forecast_shots already
+    #  filters same-bag from it.
+    #
+    #  Distinct from the new-bag case and does not contradict the owner's
+    #  "reset only, no seeded number" decision (2026-08-15): that governs a
+    #  bag with NO history, which still returns {} here. This only ever shows
+    #  numbers a bag's own shots justify.
+    # ==================================================================
+
+    # bag_key -> rec. The skin's grind tile is re-evaluated on the app's
+    # update tick (every ~200 ms), so an uncached lookup would mean opening
+    # SDB and re-running the whole engine several times a second.
+    variable bag_rec_cache {}
+
+    # Dropped whenever a new shot lands, so a fresh shot can never be masked
+    # by a cached recommendation computed before it.
+    proc invalidate_bag_rec_cache {} {
+        variable bag_rec_cache
+        set bag_rec_cache {}
+    }
+
+    # The recommendation for one bag, or {} when that bag has no eligible
+    # shots in the window. Memoized.
+    proc recommendation_for_bag {bag_key} {
+        variable bag_rec_cache
+        variable GA_FETCH_LIMIT
+
+        if {$bag_key eq ""} { return {} }
+        if {[dict exists $bag_rec_cache $bag_key]} {
+            return [dict get $bag_rec_cache $bag_key]
+        }
+
+        set rec {}
+        if {![catch {
+            lassign [locate_shot_source] db table fields
+            if {$db ne "" && $table ne ""} {
+                set rows [_filter_valid_rows \
+                    [_fetch_recent $db $table $fields $GA_FETCH_LIMIT] $fields]
+                # The bag's most recent shot; rows are newest-first.
+                set nrows [llength $rows]
+                for {set pos 0} {$pos < $nrows} {incr pos} {
+                    if {[_bag_key [lindex $rows $pos]] ne $bag_key} { continue }
+                    set r [_forecast_rec $rows $fields $pos]
+                    if {[dict size $r] > 0} { set rec [_decorate_rec $r $rows $fields $pos] }
+                    break
+                }
+            }
+        } err]} {
+            # Only cache a successful lookup: caching a failure would keep
+            # returning {} after a transient database problem cleared.
+            dict set bag_rec_cache $bag_key $rec
+        } else {
+            catch { msg -ERROR "GrindAdvisor: recommendation_for_bag failed: $err" }
+        }
+        return $rec
+    }
+
+    # The recommendation to DISPLAY for whatever bag is loaded right now.
+    #
+    # Prefers the saved one when it already describes this bag -- that is the
+    # freshest possible answer, since it was computed from the shot just
+    # pulled -- and otherwise computes from the bag's own history.
+    proc recommendation_for_current_bag {} {
+        variable last_recommendation
+        set ck [current_bag_key]
+
+        # The saved recommendation wins only when we can POSITIVELY confirm it
+        # is about this bag -- it is the freshest answer, computed from the
+        # shot just pulled.
+        #
+        # It must NOT go through last_recommendation_is_current here. That
+        # proc fails SAFE by answering "current" whenever identity is unknown,
+        # which is right for "should the tile blank?" but exactly wrong for
+        # "should I bother computing?": a recommendation saved before v3.7.0
+        # has no bag_key, so it would claim to match every bag and this would
+        # hand back the same number forever. That bug shipped in v3.8.0's
+        # first build and was reported from the tablet.
+        if {$ck ne "" && [dict exists $last_recommendation bag_key]} {
+            if {[dict get $last_recommendation bag_key] eq $ck} {
+                return $last_recommendation
+            }
+        }
+
+        set rec [recommendation_for_bag $ck]
+        if {$rec ne "" && [dict size $rec] > 0} { return $rec }
+
+        # Nothing computable. With no bean identity at all there is no per-bag
+        # answer to be had, so fall back to whatever was saved rather than
+        # blanking a machine that simply has no bean fields filled in. With a
+        # real key and no shots, the bag genuinely has no calibration yet.
+        if {$ck eq ""} { return $last_recommendation }
+        return {}
     }
 
     proc _recipe_matches {current shot} {
@@ -1320,6 +1613,21 @@ namespace eval ::plugins::GrindAdvisor {
     variable GA_DOSE_SENS 1.8
     variable GA_OUTLIER 2.0
     variable GA_MIN_SHOTS 3
+
+    # How many rows the recommendation path pulls from SDB (v3.7.0: was a
+    # hardcoded 40 at both call sites).
+    #
+    # The window must reach back far enough to hold every shot of the CURRENT
+    # bag, and with several bags in rotation those shots are interleaved with
+    # other bags'. Measured on the real history: the deepest single-bag span
+    # is 13 shots, so a 3-bag rotation spans ~39 rows and a 5-bag one ~65 --
+    # and on a machine where rinses and flushes are not purged they consume
+    # the same limit (the SQL filters removed=1, not rinses). 40 was tight for
+    # two bags and short for three.
+    #
+    # Cost, measured against the real 1071-row database: LIMIT 40 = 0.20 ms,
+    # LIMIT 200 = 0.34 ms. Bag Stats already runs 600 on every open.
+    variable GA_FETCH_LIMIT 200
 
     proc _forecast_target {} {
         set t [_to_float [_setting target_time 28.0]]
@@ -1559,6 +1867,7 @@ namespace eval ::plugins::GrindAdvisor {
             error [expr {$target - $actual}] \
             reason [_forecast_reason $fc $next] \
             shots $shots \
+            bag_key [expr {[dict exists $cur bag_key] ? [dict get $cur bag_key] : ""}] \
             method [dict get $fc method] \
             m [dict get $fc m] b [dict get $fc b] r2 [dict get $fc r2] r2raw $r2raw \
             n [dict get $fc n] normalized [dict get $fc normalized] \
@@ -1763,6 +2072,7 @@ namespace eval ::plugins::GrindAdvisor {
 
     proc _resolve_bag_fields {cols} {
         variable bag_field_patterns
+        variable bag_field_cols
         set result {}
         foreach field {bean roaster origin roast_date} {
             foreach pat $bag_field_patterns($field) {
@@ -1775,6 +2085,11 @@ namespace eval ::plugins::GrindAdvisor {
                 if {[dict exists $result $field]} { break }
             }
         }
+        # Cache the field->column mapping so current_bag_key can build the
+        # live key WITHOUT reopening the database. The skin may ask whether a
+        # recommendation is still current on every UI refresh, and that path
+        # must never touch the filesystem.
+        set bag_field_cols $result
         return $result
     }
 
@@ -3265,16 +3580,12 @@ namespace eval ::plugins::GrindAdvisor {
             incr shown
             set brows [dict get $bagrows $k]
 
-            # Label from the newest row's bag values (bean, then roaster).
-            set label $k
+            # Label from the newest row (bean, roaster, and the profile when
+            # segmentation is on -- without it the same bean run on two
+            # profiles renders as two identical-looking cards).
             set newest [lindex $brows 0]
-            set bv [expr {[dict exists $newest bag_values] ? [dict get $newest bag_values] : {}}]
-            set parts {}
-            foreach f {bean roaster} {
-                set v [string trim [_dget $bv $f]]
-                if {$v ne ""} { lappend parts $v }
-            }
-            if {[llength $parts] > 0} { set label [join $parts " · "] }
+            set label [_bag_label $newest]
+            if {$label eq ""} { set label $k }
 
             # Eligible shots (newest-first): outliers excluded, normalized
             # time -- the exact dataset the forecast regression fits.
@@ -3608,7 +3919,27 @@ namespace eval ::plugins::GrindAdvisor {
         return "not detected"
     }
 
+    proc _key_debug_value {k} {
+        if {$k eq ""} { return "(none - no bean fields set)" }
+        return $k
+    }
+
+    proc _saved_rec_key_text {} {
+        variable last_recommendation
+        if {$last_recommendation eq ""} { return "(nothing saved yet)" }
+        if {![dict exists $last_recommendation bag_key]} {
+            return "(saved before v3.7.0 - no key)"
+        }
+        set k [dict get $last_recommendation bag_key]
+        if {$k eq ""} { return "(none)" }
+        # Braces, not square brackets: [..] inside a quoted Tcl string is
+        # command substitution and would try to run "MATCHES CURRENT".
+        if {[last_recommendation_is_current]} { return "$k  (matches current)" }
+        return "$k  (STALE - different bag or profile)"
+    }
+
     proc detected_fields_text {} {
+        variable GA_FETCH_LIMIT
         lassign [locate_shot_source] db table fields
         if {$table eq ""} {
             set table "not detected"
@@ -3630,6 +3961,12 @@ namespace eval ::plugins::GrindAdvisor {
             "Dose/yield source mode: [_dose_yield_mode_label [_setting dose_yield_mode auto]]" \
             "Dose plausibility (Auto): [_fmt_num [_setting dose_min 12.0]] - [_fmt_num [_setting dose_max 22.0]] g" \
             "Ratio plausibility (Auto): [_fmt_num [_setting ratio_min 1.0]] - [_fmt_num [_setting ratio_max 4.0]]" \
+            "" \
+            "Detected profile column: [_field_debug_value $fields profile]" \
+            "Segment calibration by profile: [expr {[_segment_by_profile] ? {on} : {off}}]" \
+            "Current bag key: [_key_debug_value [current_bag_key]]" \
+            "Saved rec bag key: [_saved_rec_key_text]" \
+            "Shot window: $GA_FETCH_LIMIT rows" \
             "" \
             "Per-shot input/intermediate trace: see Calculation Details."]
         return [join $lines "\n"]
