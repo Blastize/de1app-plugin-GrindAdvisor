@@ -1,6 +1,6 @@
-# Grind Advisor
+# Grind Advisor v3.11.1
 
-Current plugin version: **v3.8.1**.
+Current plugin version: **v3.11.1**.
 
 A DE1app (Decent Espresso) plugin. After every completed espresso shot it
 reads your latest shot from **SDB** and shows a popup recommending your next
@@ -47,9 +47,11 @@ a good result.
 arithmetic rather than your calibration. The view says so instead of printing
 a reassuring zero.
 
-The y axis reads *time (normalized)* when the regression is running — that is
-the series it actually fits, with dose and yield differences divided out — and
-*shot time* on the 1- and 2-shot rungs, which work in raw time.
+The y axis reads *time (normalized)* whenever the numbers were computed from
+normalized time — the regression always is, and since v3.11.0 the 1- and
+2-shot rungs are too whenever your shots carry scale data. It reads *shot
+time* only when no normalization was in play (no scale data, or a
+recommendation saved by an older version).
 
 **You do not need to pull a shot first.** If the stored recommendation has no
 shot data attached (anything saved before v3.1.0), Curve re-reads the current
@@ -105,7 +107,10 @@ recommendation modes to pick.
 Before fitting, shot times are **normalized** to remove dose/yield weighing
 error (using your scale data when present), and shots whose weighed dose or
 yield was more than 2 g off are excluded as outliers. When your shots carry
-no scale data, the fit runs on raw times.
+no scale data, the fit runs on raw times. Since v3.11.0 the 1- and 2-shot
+rungs use the same normalized series — a 9.6s shot that produced 22.2g of a
+38g target is treated as the ~16.4s shot it would have been at full yield,
+and the reason says so: *"First shot on normalized time 16.4s"*.
 
 Verified against the reference spreadsheet's "Forecast Method" sheet: for its
 10-shot bag the plugin reproduces the exact weighted slope (−4.10 s/grind),
@@ -146,6 +151,67 @@ outgrows the card (fixed in v3.6.0).
 Everything is computed read-only from your saved shots (normalized time,
 outliers excluded) and is display-only — it never changes any
 recommendation.
+
+## When it refuses to recommend (v3.10.0)
+
+A regression is only worth following if the shot times actually moved with the
+grind. Two guards decide that:
+
+**Is the fit worth using?** If it explains less than 30% of the variation
+(R² < 0.30) the fit is discarded and the plugin falls back to nudging from
+your last shots, saying so plainly: *"Shot times are not tracking grind on
+this bag (R2 -0.05 over 13 shots), so the fit was not used."*
+
+Before this, the only test was whether the fitted slope was flat. Noise
+produces a steep slope just as easily as a real trend does — which is how a
+bag pulled 13 times between 7.5 and 8.2 came to be told "grind at 4.0".
+
+When this guard fires, **Why?** names the method as *"Regression not trusted
+(ladder)"* — the recommendation came from nudging your last shots, not from a
+fitted line. (Through v3.10.0 that row showed the internal key
+`regression_untrusted` instead; fixed in v3.10.1.)
+
+**Is the answer on ground you have stood on?** No recommendation may land more
+than half a step outside the range of grind settings that bag has actually
+been pulled at. A fitted line is evidence only between the points that made
+it. When this bites, the reason says *"held to the grind range actually
+tried"*.
+
+Neither guard makes a noisy bag calibratable. If your times swing several
+seconds at a fixed grind, the way out is a **deliberately large grind move** —
+a full step or two — so the change clears the scatter. The plugin damps every
+correction by half and will not suggest that on its own.
+
+## After editing a shot — Recalculate from History (v3.9.0)
+
+**Advanced → Shot Data → Recalculate from History.**
+
+Correcting a shot in the Shot History Editor writes `history/<file>.shot` and
+nothing else — that plugin never touches SDB, by design. Grind Advisor reads
+SDB, so on its own it will never see your correction. Four things stand in the
+way, and this button walks all four:
+
+1. **SDB has not re-read the file.** It only rescans changed `.shot` files
+   when its `populate` runs — on startup if "Resync database to history on
+   startup" is on (it is off by default), or from its own resync button.
+2. **The per-bag recommendation is memoized**, and that cache is normally
+   dropped only when a new shot lands.
+3. **A saved recommendation outranks a recomputed one** while it matches the
+   bag you have loaded.
+4. **That saved recommendation is reloaded at startup**, so restarting the app
+   does not clear it either.
+
+So the button asks SDB to resync, drops the cache, recomputes this bag from
+the corrected history, and saves the result over the stored recommendation.
+The caption under it reports what happened.
+
+**This is the one action in Grind Advisor that causes a database write** — and
+it is SDB writing its own database, through SDB's own resync entry point.
+Grind Advisor still runs nothing but `SELECT`. It is a button rather than an
+automatic behaviour because the resync rescans your whole history folder.
+
+Pulling a new shot on the bag also brings everything back in step, since that
+recomputes and re-saves in the normal way.
 
 ## Defensive SDB handling (read-only)
 
@@ -263,10 +329,6 @@ A bag with no shots still returns nothing — no invented starting grind.
 ## Settings
 
 ![The settings page](images/settings-page.jpg)
-
-Target shot time, grinder range and rounding live on the main page, with the
-Calibration Accuracy gauge beside them; **Advanced** holds the diagnostics,
-Bag Stats and the dose/yield source mode.
 
 Defaults live in `plugin.tcl` under `::plugins::GrindAdvisor::settings`:
 

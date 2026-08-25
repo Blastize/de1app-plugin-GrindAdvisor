@@ -1,5 +1,328 @@
 # Grind Advisor — Changelog
 
+## v3.11.1 (normalization only trusts plausible actuals) — 2026-08-24
+
+**Safety status: read-only, unchanged. No write behavior exists beyond the
+v3.9.0 SDB resync button.**
+
+Caught live on the tablet minutes after v3.11.0 went on, during its
+verification: the recommendation came back **5.5 → 23.7**.
+
+The engine contradicted itself. Its own yield-source logic looked at a
+13.9g actual against a 19.1g dose, called it noise — *"set 38.0g (actual
+13.9g out of ratio 0.7)"* — and fell back to the set yield. `_norm_time`
+never applied that judgement: it normalized by the raw row value anyway,
+inflating a real 50.1s shot into a fictitious **137.0s** one
+(50.1 × 38/13.9). v3.11.0 had just put the n=1 rung on normalized time, so
+that single inflated point WAS the recommendation: +18 steps, unclamped,
+because one distinct grind is not an evidence range (the documented
+pass-through). **The regression rung has carried this same exposure since
+normalization was introduced** — merely diluted by the other shots and the
+outlier exclusion. v3.11.0 did not create the bug; it removed the dilution.
+
+* **`_norm_time` now gates the actuals through the same plausibility rules
+  as `_resolve_dose`/`_resolve_yield`**: an actual dose outside
+  `dose_min..dose_max`, or an actual yield whose ratio against the best
+  dose figure falls outside `ratio_min..ratio_max`, contributes nothing —
+  the corresponding correction is skipped, and with no other actual the
+  shot normalizes to its raw time. A rejected weigh is a scale mishap or an
+  aborted shot, not a measurement. Deliberately independent of
+  `dose_yield_mode`: these are sanity bounds, not source preferences.
+* `check_guards.tcl` pins both real rows from the incident bag (13.9g
+  rejected → t_norm = raw 50.1; 22.2g trusted → 16.43), an absurd-high
+  ratio, a zero weigh, an out-of-range dose, and the end-to-end case:
+  **the 50.1s/13.9g shot alone answers 9.2, not 23.7.**
+
+Tablet-verified the same hour: Recalculate from History reports
+*"SDB resynced, recomputed: 9.2"* and the home card shows 9.2.
+
+## v3.11.0 (the 1- and 2-shot rungs use normalized time) — 2026-08-24
+
+**Safety status: read-only, unchanged. No write behavior was added in this
+version. Still nothing but `SELECT`, and the one database write in this
+plugin remains the SDB resync behind the Recalculate button (v3.9.0).**
+
+Owner-requested, from a real shot on the tablet: 9.6 seconds on the clock,
+but only **22.2g of a 38g target**. Had that shot been allowed to run to
+yield it would have taken ~16.4s — and 16.4 vs the 28s target is the error
+that says how far off the grind is. The raw clock answered a different
+question ("when was the cup pulled away") and recommended a 3-step move,
+5.5 → 2.4, where the yield-corrected error justifies half that, 5.5 → **3.6**.
+
+The regression rung has always fitted normalized time (`ynorm=1` since the
+normalization was introduced). This release brings the n=1/n=2 ladder —
+which also answers for `regression_fallback` and `regression_untrusted` —
+onto the same series, so the two halves of the engine no longer measure
+different things.
+
+* **`_ladder_small` consumes `t_norm`** for the latest shot's time and for
+  the 2-shot slope. **Shots without scale data behave exactly as before**:
+  `_norm_time` returns `t_norm == t_raw` when there are no actuals, the same
+  convention the regression has always relied on. All six historical bag
+  cases in `check_guards.tcl` answer byte-identically.
+* **The `normalized` flag is now honest on ladder recs** — set from the
+  shots the rung actually consumed (latest; plus the previous shot when the
+  2-shot slope was used) instead of hardcoded 0.
+* **The reason names the series when it matters**: *"First shot on
+  normalized time 16.4s (s/step 3.0)"*. Without that, "9.6s against a 28s
+  target, so go coarser" reads as a contradiction. The Why? dialog gains a
+  **Normalized time** row on ladder rungs for the same reason — the
+  arithmetic stays checkable by hand.
+* **The Curve view keys its y series on the rec's `normalized` flag** rather
+  than hardcoding raw-for-ladder: a recommendation saved by 3.10.x was
+  computed from raw time and carries `normalized 0`, so it still plots in
+  the series that produced its number. The axis caption ("time (normalized),
+  s" vs "shot time, s") follows the same flag automatically.
+
+`check_guards.tcl` grew a v3.11.0 section pinning: the tablet case
+(9.6 raw / 16.43 norm → **3.6**, method `first_shot`, normalized 1), the
+no-scale-data identity with 3.10.x (same shot, no actuals → **2.4**), the
+2-shot slope from t_norm, the normalized flag when only the *previous* shot
+carried scale data, and that the reason names the normalized time exactly
+when it was used and never otherwise.
+
+## v3.10.2 (a rounded grind was not a clean decimal) — 2026-08-23
+
+**Safety status: read-only, unchanged. No write behavior was added in this
+version. Still nothing but `SELECT`, and the one database write in this plugin
+remains the SDB resync behind the Recalculate button (v3.9.0).**
+
+Seen in the tablet log immediately after a Recalculate from History:
+
+```
+GrindAdvisor: refresh_from_history: SDB resynced, recomputed: 2.4000000000000004
+```
+
+`_round_grind` rounds to the configured increment by dividing, rounding, and
+multiplying back. With the increment at 0.1, `round(2.43 / 0.1)` is 24, and
+**24 × 0.1 is the next representable double above 2.4** — it prints as
+`2.4000000000000004`.
+
+**This was not only cosmetic, which is why it is fixed at the source.** That
+value becomes `next` in the recommendation dict, so it was written into
+`last_recommendation.tdb`, handed to the Lumen skin, and handed to
+ShotHistoryEditor. Every *display* path formats numbers (`_fmt_num`, the
+skin's `_num`), which is exactly why nobody had ever seen it — until
+`refresh_from_history`'s summary string, which interpolated `next` raw, began
+being printed on ShotHistoryEditor's Edit Result and Delete Result pages in
+that plugin's v0.6.0 / v0.6.3.
+
+* **`_round_grind` snaps through a fixed-precision string**, returning the
+  closest double to the decimal actually asked for. No grinder increment is
+  remotely as fine as 1e-6, so nothing real is lost. It also collapses the
+  `-0.0` that a tiny negative would otherwise carry into every downstream
+  format as "-0.0".
+* **`refresh_from_history`'s summary goes through `_fmt_num`**, like every
+  other user-facing number here. With the source fixed there is no artifact
+  left for it to hide — it formats because it is read by people.
+* **`tools/check_guards.tcl`** sweeps 0.0–50.0 at every real increment and
+  asserts on the **printed form**, since it is the string that leaked, plus
+  that the result is still within half an increment of the input. It carries
+  the tablet's exact case, `2.43 → 2.4`, as a named check.
+
+**No recommendation moved.** All six v3.10.0 bag cases return byte-identical
+results. Verified against the old implementation, where the check fails at
+increment 0.1 — the increment this tablet is actually set to. At 0.25, 0.5 and
+1.0 the old arithmetic happens to be artifact-free over this sweep, so that
+one increment is doing the work.
+
+## v3.10.1 (the untrusted rung had no label) — 2026-08-23
+
+**Safety status: read-only, unchanged. No write behavior was added in this
+version. Still nothing but `SELECT`, and the one database write in this plugin
+remains the SDB resync behind the Recalculate button (v3.9.0).**
+
+Owner spotted it on the tablet: the method chip on the home screen read
+**`regression_unt...`** — a raw internal dict key, truncated to fit.
+
+v3.10.0 added a fifth forecast rung, `regression_untrusted` (the R² guard
+handing a scattered fit back to the ladder), and never added a matching arm to
+`_forecast_method_label`. That proc's `default` arm returned the key verbatim,
+so the identifier went straight to the screen anywhere the method is named:
+the Why? dialog's **Method** row, the shot-list diagnostics, and the
+calculation diagnostics dump. The Lumen skin keeps its own copy of the same
+map, with the same gap, and that is the one in the screenshot.
+
+* **`regression_untrusted` → "Regression not trusted (ladder)"**, worded to
+  match the existing `regression_fallback` → "Regression fallback (pairwise)"
+  and the same length as it, so it fits the Why? dialog's value column exactly
+  as the current longest label already does.
+* **The `default` arm no longer returns the key.** It prettifies whatever it
+  is handed (`regression_untrusted` → "Regression untrusted"), so a rung added
+  later degrades to readable words instead of leaking an internal identifier
+  again. It is a net, not a substitute for adding the arm.
+* **`tools/check_guards.tcl` now proves every rung has a label**, and does not
+  do it from a hand-written list — a stale hand-written list is exactly what
+  caused this. It reads the rung names back out of `GrindAdvisor.tcl` (every
+  literal assigned to `method`) and asserts each one comes back from the label
+  proc as words: non-empty, not equal to the key, no underscore. Verified
+  against the v3.10.0 proc, where it fails on `regression_untrusted` — the
+  check reproduces the screenshot rather than merely passing.
+
+**No engine change.** Nothing about the forecast moved: every `eq "regression"`
+branch already treated the untrusted rung correctly as a ladder result (raw
+time on the Curve view, seconds-per-step in Why?), because those are string
+equality tests, not prefix matches. The v3.10.0 guard cases in
+`check_guards.tcl` return byte-identical results — the two broken bags still
+blocked, the four working bags still unchanged.
+
+**The Lumen skin still shows the truncated key**; its `::lumen::data::grind_method`
+map has to be fixed in the skin, in its own pass.
+
+## v3.10.0 (two guards on the regression) — 2026-08-19
+
+**Safety status: read-only, unchanged. Still nothing but `SELECT`. The one
+database write in this plugin remains the SDB resync behind the Recalculate
+button (v3.9.0).**
+
+Owner-reported: the Sure Shot bag's recommendations were "very inconsistent".
+They were. The engine recommended **4.0** for a bag that had been pulled 13
+times between **7.5 and 8.2**.
+
+Rebuilt as live formulas in a spreadsheet over the real shot database, the
+fit behind that number was:
+
+```
+m = -0.62128    b = 30.49171    R2 = -0.0544
+ideal = (28 - b) / m = 4.0106  ->  4.0
+```
+
+**R² below zero: the fitted line describes the data worse than a flat line
+through the mean.** The engine solved it anyway, because its only test was
+`|m| >= GA_M_MIN` — and that rejects a *flat* line, not a *meaningless* one.
+Noise produces a steep slope just as readily as signal does.
+
+### GA_R2_MIN 0.30 — is the fit worth using?
+
+Below it, the regression is discarded and the small-sample ladder answers
+instead, with the reason saying so in as many words: *"Shot times are not
+tracking grind on this bag (R2 -0.05 over 13 shots), so the fit was not
+used"*.
+
+The threshold was chosen by measuring, not by taste. Every bag in the real
+history:
+
+| bag | R² | outcome |
+|---|---|---|
+| Jorge Diaz Campos | 0.80 | unchanged |
+| Origin Colombia | 0.65 | unchanged |
+| Chelchele | 0.57 | unchanged |
+| Hamasho Anaerobic | 0.42 | unchanged |
+| *— 0.30 sits in the gap —* | | |
+| Guji Hambela | 0.06 | **blocked** (its fit claimed −15.3 s/grind) |
+| Sure Shot | −0.05 | **blocked** |
+
+Four working bags keep their exact recommendations; the two that were
+producing nonsense stop.
+
+### GA_EXTRAP_MARGIN 0.5 — is the answer on ground we have stood on?
+
+`_limit_to_evidence` holds any recommendation to the grind range the bag has
+actually been pulled at, plus half a step. A fitted line is only evidence
+*between* the points that made it; solving it far outside them is arithmetic,
+not calibration.
+
+This is applied to the ladder as well, which could bolt for a different
+reason: a 2-shot slope is allowed down to `GA_SLOPE_MIN` (0.1 s/grind), and
+dividing a 5-second error by 0.1 asks for a 25-step move.
+
+When the clamp bites, the reason says *"held to the grind range actually
+tried"* rather than quietly returning a different number than was computed.
+
+### What this does not fix
+
+Neither guard makes a noisy bag calibratable. To dial in a bag like Sure
+Shot you have to make a **deliberately large grind move** — a full step or
+two — so the change clears the ±3s scatter. The engine damps every
+correction by half and will never suggest that on its own.
+
+### tools/check_guards.tcl
+
+New. Sources the real plugin with the framework stubbed and drives
+`_compute_forecast` with all six bags' actual shot lists, asserting both
+halves of the claim: the guards fire on the two bad bags, and **change
+nothing on the four good ones**. Plus `_limit_to_evidence` directly, including
+that a bag pulled at a single grind setting has no range and passes through
+untouched.
+
+It earned its place twice while being written: it caught `_compute_forecast`
+missing a `variable GA_R2_MIN` declaration, and it caught a fixture whose
+numbers had been typed by hand rather than generated from `shots.db` — which
+"failed" a bag that was fine. The fixtures are generated now.
+
+## v3.9.0 (Recalculate from History, after editing a shot) — 2026-08-18
+
+**Safety status: this plugin still issues no SQL but SELECT and still opens
+the shot database read-only. One thing changed and it must be stated plainly:
+the new button asks *SDB* to resync itself, and SDB writes its own database
+when it does.** That is SDB's own public entry point — the one behind its
+"Resync database to history" button — called with SDB's own arguments. It runs
+only when you press the new button. Nothing else in Grind Advisor writes
+anywhere, and no history file is touched by either plugin here.
+
+### The problem
+
+Owner-reported from the tablet:
+
+> *"After I edited the grind setting from Shot History it worked, but it
+> didn't update the Grind Advisor recommended value."*
+
+The edit had worked. The Shot History Editor writes `history/<file>.shot` and
+deliberately nothing else. Grind Advisor reads **SDB**, so the correction was
+invisible to it — and four separate things kept it that way:
+
+1. **SDB had not re-read the file.** It does re-read a `.shot` whose mtime is
+   newer than its stored one (`SDB.tcl:2060`) — but only when `populate` runs:
+   on load if `sync_on_startup` is set, and it is `0` by default (and on this
+   tablet), or from SDB's own resync button.
+2. **`bag_rec_cache` memoizes per bag** and is only dropped when a NEW shot
+   lands, via `save_last_recommendation`.
+3. **`recommendation_for_current_bag` prefers `last_recommendation`** while it
+   matches the loaded bag, so an empty cache would not have helped: the saved
+   answer would still win.
+4. **`last_recommendation.tdb` reloads that saved answer at startup**, so
+   restarting the app did not clear it either.
+
+Any fix that addressed fewer than all four would have looked like it worked
+and changed nothing.
+
+### `refresh_from_history`
+
+A new public proc walks all four in order:
+
+1. `::plugins::SDB::populate "" "" 1` if SDB is loaded — its own call, copied
+   from its own settings page, guarded by `info procs` and `catch`.
+2. `invalidate_bag_rec_cache`.
+3. Recompute through **`recommendation_for_bag`**, not
+   `recommendation_for_current_bag`. That distinction is the point: the latter
+   returns the saved recommendation, which is the stale answer being replaced.
+4. `save_last_recommendation` on the result, so the corrected figure is what
+   `last_recommendation.tdb` holds and a restart cannot resurrect the old one.
+
+It returns a summary of what it did, and logs the same line.
+
+### Where it lives
+
+**Advanced → Shot Data → Recalculate from History**, a new card in the empty
+top-right quadrant beside Popup Tuning. Nothing else on the page moves. A
+caption under the button explains what it does and is replaced by the result
+("SDB resynced, recomputed: 8.5") after a run, then reset on the next visit so
+a stale status can never read as something that just happened.
+
+It is deliberately **not automatic**: step 1 rescans the whole history folder,
+which is expensive, and it is the only thing in this plugin that causes a
+database write. A button you press is the honest way to spend that.
+
+### Verified
+
+The file parses (`info complete`), and the changed procs
+(`refresh_from_history`, the page's `recalculate` / `_default_note` / `show`,
+and the whole `Advanced` `setup`) byte-compile. The new card's geometry was
+computed from the plugin's own `_init_layout` tokens rather than by eye: card
+`208..600`, **56px clear** of the Tools card at `656` (md is 32), right column
+ending exactly on the page's content edge, and 112px of note area for a
+two-line caption. Not yet tablet-tested.
+
 ## v3.8.1 (fix: a keyless saved recommendation masked every per-bag answer) — 2026-08-15
 
 Safety status: read-only, unchanged.

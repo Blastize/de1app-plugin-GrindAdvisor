@@ -1493,6 +1493,87 @@ namespace eval ::plugins::GrindAdvisor {
         return $rec
     }
 
+    # Rebuild everything this plugin believes about the current bag, from the
+    # shot history back up. v3.9.0, owner request.
+    #
+    # THE PROBLEM. Correcting a shot in the Shot History Editor changes
+    # history/<file>.shot and nothing else -- that plugin never writes SDB, by
+    # its own documented design. Grind Advisor reads SDB, so a corrected grind
+    # or yield is invisible to it, and four separate things keep it that way:
+    #
+    #   1. SDB only re-reads a .shot whose mtime is newer than its stored one
+    #      when populate runs -- on load if sync_on_startup is set (it is 0 by
+    #      default), or from the "Resync database to history" button.
+    #   2. bag_rec_cache memoizes per bag and is only dropped when a NEW shot
+    #      lands.
+    #   3. recommendation_for_current_bag prefers last_recommendation while it
+    #      matches the loaded bag, so even an empty cache changes nothing.
+    #   4. last_recommendation.tdb reloads that same saved answer at startup,
+    #      so restarting does not clear it either.
+    #
+    # This walks all four, in order. It is deliberately NOT automatic: step 1
+    # asks SDB to rescan the whole history folder, which is expensive, and it
+    # is the only thing in this plugin that causes a database write -- SDB's
+    # own, through SDB's own public entry point, the one its settings page
+    # calls. Grind Advisor still issues no SQL but SELECT.
+    #
+    # Returns a human-readable summary of what it did.
+    proc refresh_from_history {} {
+        set steps {}
+
+        # 1. Let SDB pick up the edited shot files.
+        if {[info procs ::plugins::SDB::populate] ne ""} {
+            if {[catch { ::plugins::SDB::populate "" "" 1 } err]} {
+                catch { msg "GrindAdvisor: SDB resync failed: $err" }
+                lappend steps [translate "SDB resync FAILED"]
+            } else {
+                lappend steps [translate "SDB resynced"]
+            }
+        } else {
+            lappend steps [translate "SDB not loaded"]
+        }
+
+        # 2. Drop every memoized per-bag recommendation.
+        invalidate_bag_rec_cache
+
+        # 3. Recompute for the loaded bag. recommendation_for_bag is the
+        #    COMPUTE path on purpose: recommendation_for_current_bag would
+        #    hand back the saved recommendation, which is the stale answer
+        #    this whole proc exists to replace.
+        set ck [current_bag_key]
+        set rec {}
+        if {$ck ne ""} {
+            catch { set rec [recommendation_for_bag $ck] }
+        }
+
+        # 4. Persist it, or the next restart reloads the stale one from
+        #    last_recommendation.tdb and prefers it all over again.
+        if {$rec ne "" && ![catch { dict size $rec }] \
+         && [dict exists $rec ok] && [dict get $rec ok]} {
+            save_last_recommendation $rec
+            set g ""
+            # v3.10.2: through _fmt_num, like every other user-facing number in
+            # this plugin. The source fix in _round_grind means there is no
+            # artifact left to hide here -- but this string is read by people
+            # (ShotHistoryEditor prints it on its Edit and Delete Result
+            # pages), so it formats for the same reason the rest do.
+            catch { set g [_fmt_num [dict get $rec next]] }
+            if {$g ne ""} {
+                lappend steps "[translate {recomputed}]: $g"
+            } else {
+                lappend steps [translate "recomputed"]
+            }
+        } elseif {$ck eq ""} {
+            lappend steps [translate "no bean set, nothing to recompute"]
+        } else {
+            lappend steps [translate "no eligible shots for this bag"]
+        }
+
+        set out [join $steps ", "]
+        catch { msg "GrindAdvisor: refresh_from_history: $out" }
+        return $out
+    }
+
     # The recommendation to DISPLAY for whatever bag is loaded right now.
     #
     # Prefers the saved one when it already describes this bag -- that is the
@@ -1610,6 +1691,30 @@ namespace eval ::plugins::GrindAdvisor {
     variable GA_SLOPE_MIN 0.1
     variable GA_M_MIN 0.5
     variable GA_DECAY 0.85
+
+    # v3.10.0 — two guards on the regression, both owner-requested after the
+    # Sure Shot bag produced a recommendation of 4.0 from shots that had only
+    # ever been pulled between 7.5 and 8.2.
+    #
+    # GA_R2_MIN: a fit explaining less than this much of the variation is not
+    # a calibration, it is a line through a cloud. Measured against the real
+    # history on 2026-08-19, the threshold separates the two cases cleanly and
+    # changes nothing on the bags that were working:
+    #
+    #     Jorge Diaz Campos  R2 0.80   unchanged
+    #     Origin Colombia    R2 0.65   unchanged
+    #     Chelchele          R2 0.57   unchanged
+    #     Hamasho Anaerobic  R2 0.42   unchanged
+    #     ---------------------------- 0.30 sits in the gap
+    #     Guji Hambela       R2 0.06   blocked (slope said -15.3 s/grind)
+    #     Sure Shot          R2 -0.05  blocked (worse than a flat line)
+    #
+    # GA_EXTRAP_MARGIN: how far past the grind settings a bag has ACTUALLY
+    # been pulled at we are willing to recommend. The engine used to solve the
+    # fitted line anywhere at all, which is how 3.5 steps beyond the finest
+    # grind ever tried became an instruction.
+    variable GA_R2_MIN 0.30
+    variable GA_EXTRAP_MARGIN 0.5
     variable GA_DOSE_SENS 1.8
     variable GA_OUTLIER 2.0
     variable GA_MIN_SHOTS 3
@@ -1650,6 +1755,25 @@ namespace eval ::plugins::GrindAdvisor {
 
     # Normalized time: scales out yield weighing error and dose error.
     # Returns {t_norm active}. active=0 with no scale data -> raw time.
+    #
+    # v3.11.1: the actuals are gated through the SAME plausibility rules as
+    # _resolve_dose / _resolve_yield before they are used. They were not,
+    # and the engine contradicted itself on the tablet: the yield-source
+    # logic rejected a 13.9g actual against a 19.1g dose as noise ("out of
+    # ratio 0.7") while this proc normalized by it anyway, inflating a real
+    # 50.1s shot into a fictitious 137.0s one -- 50.1 * (38/13.9). On the
+    # n=1 rung, which v3.11.0 moved onto normalized time, that single point
+    # WAS the recommendation: +18 steps, 5.5 -> 23.7. The regression rung
+    # carried the same exposure ever since normalization existed; it was
+    # only diluted by the other shots and the outlier exclusion.
+    #
+    # A yield ratio outside ratio_min..ratio_max or a dose outside
+    # dose_min..dose_max is a scale mishap or an aborted shot, not a
+    # measurement -- exactly what the source logic already concluded. An
+    # implausible actual now contributes nothing: the corresponding
+    # correction is skipped and, with no other actual, the shot normalizes
+    # to its raw time. Deliberately independent of dose_yield_mode: these
+    # are sanity bounds, not source preferences.
     proc _norm_time {row} {
         variable GA_DOSE_SENS
         set st [_duration_seconds [_dget $row duration]]
@@ -1658,6 +1782,27 @@ namespace eval ::plugins::GrindAdvisor {
         set ya [expr {[dict exists $row actual_yield] ? [_to_float [_dget $row actual_yield]] : ""}]
         set ds [_to_float [_dget $row dose]]
         set da [expr {[dict exists $row actual_dose] ? [_to_float [_dget $row actual_dose]] : ""}]
+        # Gate the actual dose first: the yield gate needs the best dose
+        # figure available, which _resolve_yield mirrors by taking the
+        # resolved dose.
+        if {$da ne ""} {
+            set dlo [_setting_num dose_min 12.0]
+            set dhi [_setting_num dose_max 22.0]
+            if {$da <= 0 || $da < $dlo || $da > $dhi} { set da "" }
+        }
+        if {$ya ne ""} {
+            if {$ya <= 0} {
+                set ya ""
+            } else {
+                set dref [expr {$da ne "" ? $da : $ds}]
+                if {$dref ne "" && $dref > 0} {
+                    set ratio [expr {$ya / double($dref)}]
+                    set rlo [_setting_num ratio_min 1.0]
+                    set rhi [_setting_num ratio_max 4.0]
+                    if {$ratio < $rlo || $ratio > $rhi} { set ya "" }
+                }
+            }
+        }
         set tnorm $st
         set active 0
         if {$ya ne "" && $ya > 0 && $ys ne ""} {
@@ -1743,7 +1888,52 @@ namespace eval ::plugins::GrindAdvisor {
         return [_clamp_grind [_round_grind $x]]
     }
 
-    # n=1 / n=2 rungs (also the tripped-regression fallback). Uses RAW time.
+    # Hold a recommendation to the ground the bag has actually been pulled on,
+    # plus GA_EXTRAP_MARGIN (v3.10.0).
+    #
+    # A fitted line is only evidence between the points that made it. Solving
+    # it far outside them is arithmetic, not calibration: the Sure Shot bag
+    # was pulled 13 times between 7.5 and 8.2 and the engine answered 4.0.
+    #
+    # Returns {value limited}: limited is 1 when the clamp actually bit, so
+    # the caller can say so rather than quietly handing back a different
+    # number than it computed. With fewer than two distinct grinds there is no
+    # range to speak of, and the value passes through untouched.
+    proc _limit_to_evidence {shots value} {
+        variable GA_EXTRAP_MARGIN
+        set lo ""; set hi ""; set distinct {}
+        foreach s $shots {
+            if {![dict exists $s grind]} { continue }
+            set g [dict get $s grind]
+            if {$lo eq "" || $g < $lo} { set lo $g }
+            if {$hi eq "" || $g > $hi} { set hi $g }
+            if {[lsearch -exact $distinct $g] < 0} { lappend distinct $g }
+        }
+        if {[llength $distinct] < 2} { return [list $value 0] }
+        set lo [expr {$lo - $GA_EXTRAP_MARGIN}]
+        set hi [expr {$hi + $GA_EXTRAP_MARGIN}]
+        if {$value < $lo} { return [list $lo 1] }
+        if {$value > $hi} { return [list $hi 1] }
+        return [list $value 0]
+    }
+
+    # n=1 / n=2 rungs (also the tripped-regression fallback).
+    #
+    # v3.11.0 (owner-requested): these rungs use NORMALIZED time, the same
+    # series the regression fits. They used raw time before, which made the
+    # two halves of the engine answer different questions: the owner's real
+    # first shot ran 9.6s but weighed only 22.2g of a 38g target -- had it
+    # been allowed to run to yield it would have taken ~16.4s, and THAT is
+    # the number that says how far off the grind is. Raw time answered
+    # "when was the cup pulled away" instead, and recommended a 3-step move
+    # (2.4) where the yield-corrected error justifies half that (3.6).
+    #
+    # _norm_time returns t_norm == t_raw whenever a shot carries no scale
+    # data, so shots without actuals behave exactly as before -- the same
+    # convention _weighted_regression has always relied on with ynorm=1.
+    # The `normalized` flag reports whether normalization was actually
+    # active on the shots THIS rung consumed, so the reason, the Why? row
+    # and the Curve view can all say which series produced the number.
     proc _ladder_small {shots} {
         variable GA_S_PER_STEP_DEFAULT
         variable GA_DAMP
@@ -1752,7 +1942,8 @@ namespace eval ::plugins::GrindAdvisor {
         set n [llength $shots]
         set latest [lindex $shots 0]
         set grind [dict get $latest grind]
-        set st [dict get $latest t_raw]
+        set st [dict get $latest t_norm]
+        set normalized [expr {[dict get $latest norm_active] ? 1 : 0}]
         set sps $GA_S_PER_STEP_DEFAULT
         set method first_shot
         set rc "First shot"
@@ -1760,22 +1951,36 @@ namespace eval ::plugins::GrindAdvisor {
             set prev [lindex $shots 1]
             set dg [expr {$grind - [dict get $prev grind]}]
             if {abs($dg) >= 1e-9} {
-                set slope [expr {abs(($st - [dict get $prev t_raw]) / double($dg))}]
+                set slope [expr {abs(($st - [dict get $prev t_norm]) / double($dg))}]
                 if {$slope >= $GA_SLOPE_MIN} {
                     set sps $slope; set method two_shot; set rc "2-shot calibration"
+                    if {[dict get $prev norm_active]} { set normalized 1 }
                 }
             }
         }
+        # Say which time drove the answer whenever it is not the raw one on
+        # the clock -- otherwise "9.6s, target 28s, went COARSER" reads as a
+        # contradiction.
+        if {$normalized} {
+            append rc " on normalized time [format %.1f $st]s"
+        }
         set change [expr {($st - $target) / double($sps) * $GA_DAMP}]
-        set next [_forecast_round [expr {$grind + $change}]]
+        # v3.10.0: the ladder is held to the same evidence as the regression.
+        # It can bolt too: a 2-shot slope is allowed down to GA_SLOPE_MIN
+        # (0.1 s/grind), and dividing a 5-second error by that asks for a
+        # 25-step move.
+        lassign [_limit_to_evidence $shots [expr {$grind + $change}]] want limited
+        set next [_forecast_round $want]
         return [dict create method $method next $next m "" b "" r2 "" r2raw "" \
-            n $n normalized 0 predicted_time "" s_per_step $sps reason_core $rc]
+            n $n normalized $normalized predicted_time "" s_per_step $sps reason_core $rc \
+            limited $limited]
     }
 
     # The ladder: choose the rung by eligible count n.
     proc _compute_forecast {shots} {
         variable GA_MIN_SHOTS
         variable GA_M_MIN
+        variable GA_R2_MIN
         set target [_forecast_target]
         set n [llength $shots]
         if {$n >= $GA_MIN_SHOTS} {
@@ -1783,16 +1988,44 @@ namespace eval ::plugins::GrindAdvisor {
             if {[dict get $reg ok]} {
                 set m [dict get $reg m]; set b [dict get $reg b]
                 if {abs($m) >= $GA_M_MIN} {
+                    # GUARD 1 (v3.10.0): does the fit explain anything at all?
+                    #
+                    # |m| >= GA_M_MIN only rejects a FLAT line. Noise produces
+                    # a steep one just as easily -- Sure Shot fitted -0.62
+                    # s/grind through shots whose R2 was -0.05, worse than no
+                    # line at all. A slope that confident out of data that
+                    # scattered is not measuring the bean, it is measuring the
+                    # puck prep. Hand back to the ladder, which at least only
+                    # claims to be nudging from the last shot.
+                    set r2 [dict get $reg r2]
+                    if {$r2 ne "" && $r2 < $GA_R2_MIN} {
+                        set fb [_ladder_small $shots]
+                        dict set fb method regression_untrusted
+                        dict set fb n $n
+                        dict set fb r2 $r2
+                        dict set fb reason_core \
+                            "Shot times are not tracking grind on this bag (R2 [format %.2f $r2] over $n shots), so the fit was not used"
+                        return $fb
+                    }
+
+                    # GUARD 2 (v3.10.0): stay on ground this bag has been
+                    # pulled on. See _limit_to_evidence.
                     set ideal [expr {($target - $b) / double($m)}]
-                    set next [_forecast_round $ideal]
+                    lassign [_limit_to_evidence $shots $ideal] want limited
+                    set next [_forecast_round $want]
                     set pred [expr {$m*$next + $b}]
                     set regraw [_weighted_regression $shots 0]
                     set r2raw [expr {[dict get $regraw ok] ? [dict get $regraw r2] : ""}]
+                    set core "Regression over $n shots"
+                    if {$limited} {
+                        append core ", held to the grind range actually tried"
+                    }
                     return [dict create method regression next $next m $m b $b \
-                        r2 [dict get $reg r2] r2raw $r2raw n $n \
+                        r2 $r2 r2raw $r2raw n $n \
                         normalized [dict get $reg normalized] \
                         predicted_time $pred s_per_step "" \
-                        reason_core "Regression over $n shots"]
+                        limited $limited ideal_raw $ideal \
+                        reason_core $core]
                 }
                 set why "slope [format %.2f $m] too flat"
             } else {
@@ -1812,17 +2045,34 @@ namespace eval ::plugins::GrindAdvisor {
         if {[dict get $fc method] eq "regression"} {
             return "$core (slope [format %.2f [dict get $fc m]] s/grind, predicts [format %.1f [dict get $fc predicted_time]]s at [format %.1f $next])."
         }
-        return "$core (s/step [format %.1f [dict get $fc s_per_step]])."
+        set out "$core (s/step [format %.1f [dict get $fc s_per_step]])"
+        # v3.10.0: say when the answer was pulled back to the tried range,
+        # rather than quietly returning a different number than was computed.
+        if {[dict exists $fc limited] && [dict get $fc limited]} {
+            append out ", held to the grind range actually tried"
+        }
+        return "$out."
     }
 
+    # Every rung _compute_forecast can set must have an arm here. v3.10.0 added
+    # regression_untrusted and did not add one, so the raw dict key reached the
+    # UI: the Why? dialog's Method row read "regression_untrusted", and the
+    # Lumen skin's method chip -- which has its own map with the same gap --
+    # showed a truncated "regression_unt...".
+    #
+    # The default arm no longer hands back the key verbatim. A rung added later
+    # degrades to readable words instead of leaking an internal identifier
+    # again. It is a net, not a substitute for the arm: add the arm.
     proc _forecast_method_label {method} {
         switch -- $method {
-            first_shot          { return "First shot" }
-            two_shot            { return "2-shot calibration" }
-            regression          { return "Regression forecast" }
-            regression_fallback { return "Regression fallback (pairwise)" }
-            default             { return $method }
+            first_shot           { return "First shot" }
+            two_shot             { return "2-shot calibration" }
+            regression           { return "Regression forecast" }
+            regression_fallback  { return "Regression fallback (pairwise)" }
+            regression_untrusted { return "Regression not trusted (ladder)" }
         }
+        if {$method eq ""} { return "" }
+        return [string totitle [string map {_ " "} $method]]
     }
 
     proc _forecast_excluded_txt {rec} {
@@ -1878,9 +2128,34 @@ namespace eval ::plugins::GrindAdvisor {
             grinder_min $gmin grinder_max $gmax]
     }
 
+    # Round to the configured increment.
+    #
+    # v3.10.2: the multiply is where 2.4 stopped being 2.4. round(2.43/0.1) is
+    # 24, and 24 * 0.1 is the next representable double ABOVE 2.4 -- it prints
+    # as 2.4000000000000004. Seen on the tablet in
+    #
+    #   GrindAdvisor: refresh_from_history: SDB resynced, recomputed:
+    #   2.4000000000000004
+    #
+    # That was never only cosmetic. This value becomes `next` in the rec dict,
+    # which is written to last_recommendation.tdb and handed to the skin and to
+    # ShotHistoryEditor. Every DISPLAY path happened to format it, so the
+    # artifact stayed hidden until refresh_from_history's summary -- which
+    # interpolated it raw -- started being printed on ShotHistoryEditor's
+    # result pages.
+    #
+    # Fixed at the source so the artifact never enters the dict at all, rather
+    # than in the one string that happened to reveal it. Snapping through a
+    # fixed-precision string returns the closest double to the decimal the
+    # user actually set: no grinder increment is anywhere near as fine as
+    # 1e-6, so nothing real is lost.
     proc _round_grind {value} {
         set inc [_safe_rounding_increment]
-        return [expr {round($value / double($inc)) * double($inc)}]
+        set out [expr {round($value / double($inc)) * double($inc)}]
+        # Also collapses the -0.0 that a tiny negative would otherwise carry
+        # into every downstream format as "-0.0".
+        if {$out == 0} { return 0.0 }
+        return [expr {double([format %.6f $out])}]
     }
 
     proc _safe_rounding_increment {} {
@@ -2628,10 +2903,16 @@ namespace eval ::plugins::GrindAdvisor {
     # The plotted y series MUST be the series the model fitted, or the drawn
     # residuals and the reported R2 would describe different things:
     # _weighted_regression is always called with ynorm=1, so `regression`
-    # works in t_norm; every other rung comes from _ladder_small, which works
-    # in RAW time. For those rungs there is no fitted line, so we draw the one
-    # the ladder implies: through the latest shot with slope -s_per_step,
-    # because it solves next = grind + (t - target)/s_per_step.
+    # works in t_norm — and since v3.11.0 the ladder rungs work in t_norm
+    # too. The choice is keyed on the REC's own `normalized` flag rather
+    # than hardcoded per rung, because a recommendation saved by 3.10.x was
+    # computed from raw time and carries normalized 0: plotting it in
+    # t_norm would draw residuals that disagree with its own `next`. (When
+    # normalization was never active the two series are identical anyway —
+    # _norm_time returns t_norm == t_raw without scale data.) For ladder
+    # rungs there is no fitted line, so we draw the one the ladder implies:
+    # through the latest shot with slope -s_per_step, because it solves
+    # next = grind + (t - target)/s_per_step.
     # Guarantee a rec that carries the bag's shots.
     #
     # A recommendation saved by an older version has no `shots` key -- but the
@@ -2659,7 +2940,7 @@ namespace eval ::plugins::GrindAdvisor {
         }
 
         set method [_dget $rec method]
-        set use_norm [expr {$method eq "regression"}]
+        set use_norm [expr {$method eq "regression" || [_dget $rec normalized] == 1}]
 
         set pts {}
         foreach s $shots {
@@ -3162,6 +3443,17 @@ namespace eval ::plugins::GrindAdvisor {
                     "Model fit R\u00B2" [_forecast_r2_txt $rec] \
                     "Predicted time" "[_fmt_num [dict get $rec predicted_time]]s at [_fmt_num [dict get $rec next]]"
             } else {
+                # v3.11.0: the ladder works in normalized time now. When that
+                # differs from the clock, show the number the rung actually
+                # used, or the Shot time row above makes the recommendation
+                # look like it moved the wrong way.
+                if {[_dget $rec normalized] == 1} {
+                    set _tn ""
+                    catch { set _tn [dict get [lindex [dict get $rec shots] 0] t_norm] }
+                    if {$_tn ne ""} {
+                        lappend rows "Normalized time" "[_fmt_num $_tn]s (what this rung used)"
+                    }
+                }
                 lappend rows "Seconds per step" [_fmt_num [dict get $rec s_per_step]]
             }
             lappend rows "Rounded" "to [_fmt_num [dict get $rec rounding_increment]] \u2192 [_fmt_num [dict get $rec next]]" \
@@ -4538,6 +4830,28 @@ namespace eval ::dui::pages::GrindAdvisor_advanced {
             incr row
         }
 
+        # Shot Data card (v3.9.0), in the empty top-right quadrant beside
+        # Popup Tuning -- nothing else moves. One button plus a status line
+        # that starts as its explanation and is replaced by the result.
+        # Height budget: pad, title, md, button, md, two caption lines, pad.
+        # It must END clear of the full-width Tools card below, so the note
+        # text is kept short enough not to wrap past two lines at this width.
+        set data_note_h [expr {int(round(32 * $L(scale)))}]
+        set data_h [expr {2 * $L(sec_pad) + $L(sec_title_h) + $L(md) \
+                          + $L(btn_h) + $L(md) + $data_note_h}]
+        set drows_y [::plugins::GrindAdvisor::_sec_card $page sec_data $c2x $L(sec_top) \
+            $col_w $data_h "Shot Data"]
+        dui add dbutton $page [expr {$c2x + $L(sec_pad)}] $drows_y \
+            [expr {$c2x + $col_w - $L(sec_pad)}] [expr {$drows_y + $L(btn_h)}] \
+            -tags recalc_from_history -label [translate "Recalculate from History"] \
+            -command ::dui::pages::GrindAdvisor_advanced::recalculate \
+            -label_font $L(font_button) -style ga_btn
+        dui add dtext $page [expr {$c2x + $L(sec_pad)}] \
+            [expr {$drows_y + $L(btn_h) + $L(md)}] -tags recalc_note \
+            -text [::dui::pages::GrindAdvisor_advanced::_default_note] \
+            -font $L(font_caption) -width [expr {$col_w - 2 * $L(sec_pad)}] \
+            -fill "#666666" -anchor nw -justify left
+
         # Tools card: full content width, 2x3 grid of buttons inside.
         set tools_y [expr {$L(sec_top) + $ptun_h + $L(sec_gap)}]
         set rows_y [::plugins::GrindAdvisor::_sec_card $page sec_tools $lx $tools_y $L(content_w) $tools_h "Tools"]
@@ -4575,6 +4889,28 @@ namespace eval ::dui::pages::GrindAdvisor_advanced {
 
     proc show { page_to_hide page_to_show } {
         ::plugins::GrindAdvisor::apply_defaults
+        # Back to the explanation: a status line from a previous visit would
+        # read as the result of something that just happened.
+        catch { dui item config $page_to_show recalc_note -text [_default_note] }
+    }
+
+    # Deliberately short: the card's note area is two caption lines, and a
+    # third would spill past the card into the Tools card below.
+    proc _default_note {} {
+        return [translate "Re-reads edited shots into SDB and recomputes this bag."]
+    }
+
+    # v3.9.0. The whole chain lives in ::plugins::GrindAdvisor::refresh_from
+    # _history; this only reports what it did.
+    proc recalculate {} {
+        catch { dui item config GrindAdvisor_advanced recalc_note \
+            -text [translate "Working..."] }
+        set status ""
+        if {[catch { set status [::plugins::GrindAdvisor::refresh_from_history] } err]} {
+            catch { msg "GrindAdvisor: recalculate failed: $err" }
+            set status [translate "Failed - see the app log"]
+        }
+        catch { dui item config GrindAdvisor_advanced recalc_note -text $status }
     }
 
     proc page_done {} {
