@@ -1,6 +1,15 @@
-# Grind Advisor v3.11.1
+# Grind Advisor v3.13.1
 
-Current plugin version: **v3.11.1**.
+Current plugin version: **v3.13.1** — loading a cleaning / flush / rinse
+profile no longer blanks the recommendation: a non-espresso profile is not
+a bag identity, so the saved number stays on screen until you switch back
+to a real espresso profile. Previous (v3.13.0): a freshly scanned bag with no shots
+now shows a data-derived **starting estimate** ("Start ~13.5 (est. from 4
+bags)") borrowed from already-calibrated bags on the same profile, instead
+of only "-" and the new-bag note. Display-only: it never feeds the
+regression or Calibration Accuracy. (This reverses the 2026-08-15
+"reset only, never seed" decision — reversed by the owner, recorded in the
+changelog.)
 
 A DE1app (Decent Espresso) plugin. After every completed espresso shot it
 reads your latest shot from **SDB** and shows a popup recommending your next
@@ -324,7 +333,35 @@ It prefers the saved recommendation when that already describes the loaded bag
 Results are memoized per bag and the cache is dropped whenever a new shot
 lands, so this is safe to call from a refresh path that runs every 200 ms.
 
-A bag with no shots still returns nothing — no invented starting grind.
+A bag with no shots still returns nothing here — see the starting estimate
+below for what a skin can show instead.
+
+### New-bag starting estimate (v3.13.0)
+
+For a bag with **no shots yet**, `::plugins::GrindAdvisor::starting_estimate`
+returns a display-only starting grind borrowed from bags whose per-bag fit
+converged (the Bag Stats trust gate: 4+ shots, ≥ 1.0 grind spread,
+|slope| ≥ 0.5) on the **same profile**. First rung that yields data wins:
+
+1. `same_coffee` — same bean and roaster (a re-bought coffee) → the most
+   recent such bag's ideal grind.
+2. `same_roaster` — same roaster → median of those bags' ideal grinds.
+3. `same_profile` — any bag on this profile → median of the 6 most recently
+   used bags' ideal grinds.
+4. none → empty string; show the plain new-bag note as before.
+
+The result dict carries `grind` (rounded to the grind rounding increment and
+clamped to the grinder range), `rung`, `bags`, `rung_txt`, `label`
+(`Start ~13.5 (est. from 4 bags)`), `reason`
+(`Starting estimate: same roaster (4 bags)`) and `sources` (the source bags'
+labels). Rules for skins: present it as an estimate — **never with the word
+"Recommended"** — and do not call it from a per-tick refresh path (it reads
+SDB and is not memoized; call it when the bag changes or a page opens).
+
+The estimate is not evidence: it never enters the regression, never counts
+as a shot, and never touches n, the slope, or Calibration Accuracy. Shot 1
+on a new bag still runs the normal First-shot rung, which replaces the
+estimate with a real per-bag number.
 
 ## Settings
 

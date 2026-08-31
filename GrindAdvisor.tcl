@@ -98,9 +98,12 @@ namespace eval ::plugins::GrindAdvisor {
             ratio_min                1.0
             ratio_max                4.0
             segment_by_profile       1
+            theme                    light
         } {
             if {![info exists settings($k)]} { set settings($k) $v }
         }
+        # v3.12.0: the page theme must be one of exactly two values.
+        if {$settings(theme) ni {light dark}} { set settings(theme) light }
     }
 
     proc _setting {key default} {
@@ -133,6 +136,194 @@ namespace eval ::plugins::GrindAdvisor {
     # ------------------------------------------------------------------
     variable L
     array set L {}
+
+    # ------------------------------------------------------------------
+    #  Page-theme palette (v3.12.0). Every color the settings pages
+    #  paint comes from these tokens, per settings(theme) (light | dark,
+    #  default light). The after-shot popup and the History / Bag Stats
+    #  overlays keep their own independent popup_theme (_colors).
+    # ------------------------------------------------------------------
+
+    proc _apply_palette {} {
+        variable L
+        variable settings
+        set dark 0
+        catch { if {$settings(theme) eq "dark"} { set dark 1 } }
+        if {$dark} {
+            set L(page_bg)      "#23252e"
+            set L(sec_fill)     "#32353f"
+            set L(sec_outline)  "#464b58"
+            set L(text_hi)      "#e8e9ee"
+            set L(text_body)    "#c2c5cf"
+            set L(text_mut)     "#8d92a0"
+            set L(value_blue)   "#8ab4ff"
+            set L(entry_bg)     "#3a3e4a"
+            set L(conf_fill)    "#8fb8ff"
+            set L(conf_empty)   "#454a57"
+            set L(btn_fill)     "#4a5473"
+            set L(btn_disabled_fill) "#3a3e4a"
+        } else {
+            set L(page_bg)      "#d5d6e3"   ;# stock settings-page grey
+            set L(sec_fill)     "#FFFFFF"
+            set L(sec_outline)  "#dcdcdc"
+            set L(text_hi)      "#2b2b2b"
+            set L(text_body)    "#444444"
+            set L(text_mut)     "#666666"
+            set L(value_blue)   "#4e85f4"
+            set L(entry_bg)     "#fbfaff"
+            set L(conf_fill)    "#4d84f3"
+            set L(conf_empty)   "#e3e6ee"
+            set L(btn_fill)     "#c0c5e3"   ;# stock dbutton periwinkle
+            set L(btn_disabled_fill) "#dddddd"
+        }
+    }
+
+    proc _glyph_for {name} {
+        set glyph ""
+        catch {
+            if {[dui symbol exists $name]} { set glyph [dui symbol get $name] }
+        }
+        return $glyph
+    }
+
+    # Moon in light mode (tap for dark), sun-bright in dark; text fallback.
+    proc _theme_button_face {} {
+        variable L
+        variable settings
+        set dark 0
+        catch { if {$settings(theme) eq "dark"} { set dark 1 } }
+        if {[info exists L(have_icons)] && $L(have_icons)} {
+            set g [_glyph_for [expr {$dark ? "sun-bright" : "moon"}]]
+            if {$g ne ""} { return $g }
+        }
+        return [expr {$dark ? [translate "Light"] : [translate "Dark"]}]
+    }
+
+    proc toggle_theme {} {
+        variable settings
+        set settings(theme) [expr {$settings(theme) eq "dark" ? "light" : "dark"}]
+        save_settings
+        _apply_palette
+        _retheme_all
+        catch { ::dui::pages::GrindAdvisor_settings::refresh_values GrindAdvisor_settings }
+        catch { dui item config GrindAdvisor_settings btn_theme -label [_theme_button_face] }
+        catch { msg "GrindAdvisor: page theme switched to $settings(theme)" }
+    }
+
+    # Repaint every palette-colored item by bare tag across the 7 dui
+    # pages (the popup/overlay dialogs re-read their own _colors on every
+    # draw and need nothing here). Buttons restyle through their -btn
+    # shape tags; labels stay white. The dcheckboxes on History Display
+    # Options get their box symbol AND label recolored.
+    proc _retheme_all {} {
+        variable L
+        foreach p {GrindAdvisor_settings GrindAdvisor_history_options
+                   GrindAdvisor_advanced GrindAdvisor_help
+                   GrindAdvisor_diagnostics GrindAdvisor_calculation_details
+                   GrindAdvisor_dose_yield} {
+            catch { dui item config $p page_bg -fill $L(page_bg) -outline $L(page_bg) }
+            catch { dui item config $p page_title -fill $L(text_hi) }
+            catch { dui item config $p subtitle -fill $L(text_mut) }
+            catch { dui item config $p version_text -fill $L(text_mut) }
+            catch { dui item config $p pg_ind -fill $L(text_mut) }
+        }
+        # Section cards.
+        foreach {p sec} {
+            GrindAdvisor_settings sec_shot
+            GrindAdvisor_settings sec_actions
+            GrindAdvisor_settings sec_reco
+            GrindAdvisor_settings sec_popup
+            GrindAdvisor_advanced sec_ptun
+            GrindAdvisor_advanced sec_data
+            GrindAdvisor_advanced sec_tools
+            GrindAdvisor_help sec_help
+            GrindAdvisor_diagnostics sec_diag
+            GrindAdvisor_calculation_details sec_calcd
+            GrindAdvisor_dose_yield sec_dy
+        } {
+            catch { dui item config $p ${sec}_bg -fill $L(sec_fill) -outline $L(sec_outline) }
+            catch { dui item config $p ${sec}_title -fill $L(text_hi) }
+        }
+        # Text roles.
+        foreach {p tag role} {
+            GrindAdvisor_settings target_time_label text_body
+            GrindAdvisor_settings grinder_min_label text_body
+            GrindAdvisor_settings grinder_max_label text_body
+            GrindAdvisor_settings rounding_label text_body
+            GrindAdvisor_settings theme_label text_body
+            GrindAdvisor_settings popup_label text_body
+            GrindAdvisor_settings conf_label text_body
+            GrindAdvisor_settings conf_text text_body
+            GrindAdvisor_settings rounding_value value_blue
+            GrindAdvisor_settings popup_theme_value value_blue
+            GrindAdvisor_settings enable_popup_value value_blue
+            GrindAdvisor_advanced popup_delay_ms_label text_body
+            GrindAdvisor_advanced popup_font_scale_label text_body
+            GrindAdvisor_advanced recalc_note text_mut
+            GrindAdvisor_help help_text text_body
+            GrindAdvisor_diagnostics diagnostics_text text_body
+            GrindAdvisor_calculation_details calculation_text text_body
+            GrindAdvisor_dose_yield mode_label text_body
+            GrindAdvisor_dose_yield mode_value value_blue
+            GrindAdvisor_dose_yield dose_min_label text_body
+            GrindAdvisor_dose_yield dose_max_label text_body
+            GrindAdvisor_dose_yield ratio_min_label text_body
+            GrindAdvisor_dose_yield ratio_max_label text_body
+            GrindAdvisor_dose_yield dy_help text_mut
+        } {
+            catch { dui item config $p $tag -fill $L($role) }
+        }
+        # Entries (Tk widgets).
+        foreach {p tag} {
+            GrindAdvisor_settings target_time
+            GrindAdvisor_settings grinder_min
+            GrindAdvisor_settings grinder_max
+            GrindAdvisor_advanced popup_delay_ms
+            GrindAdvisor_advanced popup_font_scale
+            GrindAdvisor_dose_yield dose_min
+            GrindAdvisor_dose_yield dose_max
+            GrindAdvisor_dose_yield ratio_min
+            GrindAdvisor_dose_yield ratio_max
+        } {
+            catch { dui item config $p $tag -bg $L(entry_bg) -foreground $L(value_blue) }
+        }
+        # History Display Options checkboxes: box symbol + label.
+        foreach k {history_show_datetime history_show_set_grind
+                   history_show_recommended_grind history_show_set_dose
+                   history_show_set_ratio history_show_set_yield
+                   history_show_actual_yield history_show_shot_time
+                   history_show_reason history_show_bag_shot} {
+            catch { dui item config GrindAdvisor_history_options $k -fill $L(text_hi) }
+            catch { dui item config GrindAdvisor_history_options ${k}-lbl -fill $L(text_body) }
+        }
+        # Confidence gauge segments get their real fills from
+        # refresh_confidence (palette-aware); park them on the empty color
+        # so nothing keeps a stale tint if refresh cannot run.
+        for {set i 0} {$i < 10} {incr i} {
+            catch { dui item config GrindAdvisor_settings conf_seg$i \
+                -fill $L(conf_empty) -outline $L(conf_empty) }
+        }
+        # Buttons: shape fills; labels stay white in both themes.
+        foreach {p tags} {
+            GrindAdvisor_settings {show_latest_recommendation recent_shot_history
+                                   bag_stats_action rounding_btn theme_btn popup_btn
+                                   page_done advanced btn_theme}
+            GrindAdvisor_history_options {page_done}
+            GrindAdvisor_advanced {recalc_from_history dose_yield_source
+                                   history_display_options diagnostics
+                                   calculation_details help_guide bag_stats page_done}
+            GrindAdvisor_help {page_done pg_prev pg_next}
+            GrindAdvisor_diagnostics {page_done pg_prev pg_next}
+            GrindAdvisor_calculation_details {page_done pg_prev pg_next}
+            GrindAdvisor_dose_yield {mode_btn page_done}
+        } {
+            foreach t $tags {
+                catch { dui item config $p ${t}-btn \
+                    -fill $L(btn_fill) -outline $L(btn_fill) \
+                    -disabledfill $L(btn_disabled_fill) -disabledoutline $L(btn_disabled_fill) }
+            }
+        }
+    }
 
     proc _init_layout {} {
         variable L
@@ -196,8 +387,10 @@ namespace eval ::plugins::GrindAdvisor {
         set L(sec_btn_w) [expr {int(round(140 * $scale))}]
         set L(entry_row_h) [expr {int(round(48 * $scale))}]
         set L(entry_row_pitch) [expr {$L(entry_row_h) + $L(md)}]
-        set L(sec_fill) "#FFFFFF"
-        set L(sec_outline) "#dcdcdc"
+        # v3.12.0: all colors live in _apply_palette (light / dark per
+        # settings(theme)) so the sun/moon toggle can swap them at
+        # runtime. The popup keeps its own independent popup_theme.
+        _apply_palette
 
         # v2.1.0 calibration-accuracy gauge: 10-segment bar, one accent for
         # filled segments and one neutral for empty (no rainbow), plus the
@@ -207,8 +400,7 @@ namespace eval ::plugins::GrindAdvisor {
         set L(conf_seg_gap) [expr {int(round(3 * $scale))}]
         set L(conf_seg_h) [expr {int(round(20 * $scale))}]
         set L(conf_seg_r) [expr {int(round(4 * $scale))}]
-        set L(conf_fill) "#4e85f4"
-        set L(conf_empty) "#e3e6ee"
+        # conf_fill / conf_empty come from _apply_palette (above).
         set L(conf_poor_max) 39
         set L(conf_fair_max) 64
         set L(conf_good_max) 84
@@ -225,9 +417,7 @@ namespace eval ::plugins::GrindAdvisor {
         # theme is current at load time (Lumen's DYE integration switches
         # the current theme to DYE_Lumen mid-load; this plugin escaped the
         # resulting invisible-button bug only by loading before the switch).
-        set L(page_bg) "#d5d6e3"           ;# stock settings-page grey
-        set L(btn_fill) "#c0c5e3"          ;# stock dbutton periwinkle
-        set L(btn_disabled_fill) "#dddddd"
+        # page_bg / btn_fill / btn_disabled_fill come from _apply_palette.
         set L(btn_label_fill) white
         set L(sec_radius) $L(card_radius)
 
@@ -263,6 +453,24 @@ namespace eval ::plugins::GrindAdvisor {
                     font create $fname -family Helvetica -size [expr {-$px}] -weight $weight
                 }
                 set L(font_$name) $fname
+            }
+        }
+
+        # v3.12.0: icon font for the theme toggle's sun/moon face (the
+        # app's own FA6 Pro file; text fallback when unavailable).
+        set L(have_icons) 0
+        set L(font_icon) $L(font_button)
+        catch {
+            set fam [dui::font::add_or_get_familyname "Font Awesome 6 Pro-Regular-400.otf"]
+            if {$fam ne ""} {
+                set px [expr {int(max(16, round(26 * $font_scale)))}]
+                if {[lsearch -exact [font names] GA_icon] >= 0} {
+                    font configure GA_icon -family $fam -size [expr {-$px}]
+                } else {
+                    font create GA_icon -family $fam -size [expr {-$px}]
+                }
+                set L(font_icon) GA_icon
+                set L(have_icons) 1
             }
         }
 
@@ -329,7 +537,7 @@ namespace eval ::plugins::GrindAdvisor {
             -fill $L(sec_fill) -outline $L(sec_outline) -width 2 -tags ${tag}_bg
         dui add dtext $page [expr {$x + $L(sec_pad)}] [expr {$y + $L(sec_pad) + $L(sec_title_h) / 2}] \
             -tags ${tag}_title -text [translate $title] -font $L(font_section) \
-            -width [expr {$w - 2 * $L(sec_pad)}] -fill "#2b2b2b" -anchor w -justify left
+            -width [expr {$w - 2 * $L(sec_pad)}] -fill $L(text_hi) -anchor w -justify left
         return [expr {$y + $L(sec_pad) + $L(sec_title_h) + $L(md)}]
     }
 
@@ -346,6 +554,14 @@ namespace eval ::plugins::GrindAdvisor {
         dui page add GrindAdvisor_diagnostics -namespace true -theme default -type fpdialog
         dui page add GrindAdvisor_calculation_details -namespace true -theme default -type fpdialog
         dui page add GrindAdvisor_dose_yield -namespace true -theme default -type fpdialog
+        # v3.12.0: nearly everything is created from palette tokens, but
+        # the History Display Options checkboxes take their colors from
+        # framework defaults -- one retheme pass makes a dark restart
+        # come up fully dark.
+        variable settings
+        if {[info exists settings(theme)] && $settings(theme) eq "dark"} {
+            catch { _retheme_all }
+        }
         return GrindAdvisor_settings
     }
 
@@ -357,14 +573,30 @@ namespace eval ::plugins::GrindAdvisor {
         variable last_recommendation
         if {$last_recommendation eq ""} { load_last_recommendation }
         if {$last_recommendation eq ""} {
-            present_result [dict create ok 0 error "No saved Grind Advisor recommendation yet."]
+            set est {}
+            catch { set est [starting_estimate] }
+            if {$est ne ""} {
+                present_result [dict create ok 0 error \
+                    "[dict get $est label]\n\n[new_bag_note].\n\n[dict get $est reason]."]
+            } else {
+                present_result [dict create ok 0 error "No saved Grind Advisor recommendation yet."]
+            }
             return
         }
         # v3.7.0: the saved recommendation is about a specific bag and
         # profile. If the user has switched since, presenting that number
         # would be actively misleading -- it is a calibration for a different
-        # coffee. Say so instead of showing it. Owner decision (2026-08-15):
-        # reset only, never seed a guessed grind for a new bag.
+        # coffee. Say so instead of showing it.
+        #
+        # v3.13.0: when the loaded bag also has NO shots of its own, a
+        # display-only starting estimate is shown above the new-bag note
+        # (see starting_estimate). This reverses the owner decision of
+        # 2026-08-15 ("reset only, never seed a guessed grind for a new
+        # bag") -- reversed by the owner in the v3.13.0 pass spec. The
+        # v3.7.0 reset itself stays, the estimate is never labeled
+        # "Recommended", and it feeds no math. present_result never saves
+        # ok-0 dicts (save_last_recommendation guards on ok), so the
+        # estimate cannot overwrite the saved recommendation either.
         if {![last_recommendation_is_current]} {
             set was ""
             if {[dict exists $last_recommendation bag_label]} {
@@ -372,8 +604,15 @@ namespace eval ::plugins::GrindAdvisor {
             }
             set detail "The saved recommendation is for a different bag or profile."
             if {$was ne ""} { set detail "The saved recommendation is for $was." }
-            present_result [dict create ok 0 error \
-                "[new_bag_note].\n\n$detail"]
+            set est {}
+            catch { set est [starting_estimate] }
+            if {$est ne ""} {
+                present_result [dict create ok 0 error \
+                    "[dict get $est label]\n\n[new_bag_note].\n\n[dict get $est reason].\n$detail"]
+            } else {
+                present_result [dict create ok 0 error \
+                    "[new_bag_note].\n\n$detail"]
+            }
             return
         }
         present_result $last_recommendation
@@ -1384,9 +1623,12 @@ namespace eval ::plugins::GrindAdvisor {
         return [dict create bean bean_type roaster bean_brand roast_date roast_date]
     }
 
-    # The calibration key for what is loaded RIGHT NOW, built from the live
-    # ::settings the way a shot pulled this instant would be recorded.
-    proc current_bag_key {} {
+    # The live bag metadata values from ::settings, read through the same
+    # field->column mapping the row-built keys use. Split out of
+    # current_bag_key in v3.13.0 so starting_estimate can match the loaded
+    # bag's bean/roaster field-by-field (the composed key drops empty
+    # segments, so it cannot be parsed back into fields).
+    proc _current_bag_values {} {
         set bv {}
         dict for {field col} [_current_bag_cols] {
             set v ""
@@ -1395,13 +1637,41 @@ namespace eval ::plugins::GrindAdvisor {
             }
             dict set bv $field $v
         }
+        return $bv
+    }
+
+    proc _current_profile {} {
         set profile ""
         catch {
             if {[info exists ::settings(profile_title)]} {
                 set profile $::settings(profile_title)
             }
         }
-        return [_compose_bag_key $bv $profile]
+        return $profile
+    }
+
+    # The calibration key for what is loaded RIGHT NOW, built from the live
+    # ::settings the way a shot pulled this instant would be recorded.
+    #
+    # v3.13.1: a NON-ESPRESSO profile (cleaning, backflush, rinse, descale
+    # ... -- the same _text_is_nonespresso gate that keeps such rows out of
+    # the evidence) is not a bag identity. Owner report, 2026-08-31: running
+    # "Cleaning/Forward Flush x5" blanked the skin's grind tile, because the
+    # bean + cleaning-profile key named a "bag" with no shots. Returning ""
+    # is the documented identity-indeterminate value, so every consumer
+    # falls back to its fail-safe: last_recommendation_is_current answers 1,
+    # recommendation_for_current_bag hands back the saved recommendation
+    # (the number survives the cleaning session on screen), and
+    # starting_estimate stays silent. Only when segmentation is on -- with
+    # it off the bean-only key still matches the bag's shots and there is
+    # no bug to fix. Rows are untouched: a recorded cleaning run is already
+    # rejected by _row_is_valid_espresso before any key is built.
+    proc current_bag_key {} {
+        set profile [_current_profile]
+        if {[_segment_by_profile] && [_text_is_nonespresso $profile]} {
+            return ""
+        }
+        return [_compose_bag_key [_current_bag_values] $profile]
     }
 
     # 1 when the saved recommendation describes the currently loaded bag and
@@ -1426,6 +1696,139 @@ namespace eval ::plugins::GrindAdvisor {
     }
 
     # ==================================================================
+    #  New-bag starting estimate (v3.13.0)
+    #
+    #  What to show for a bag that has NO shots yet: a display-only
+    #  starting point borrowed from bags this plugin has already
+    #  calibrated, so the first shot is not a blind guess.
+    #
+    #  This REVERSES the owner decision of 2026-08-15 ("reset only, never
+    #  seed a guessed grind for a new bag") -- reversed by the owner in
+    #  the v3.13.0 pass spec, 2026-08-29. The v3.7.0 bag-key reset itself
+    #  stays: the estimate is layered on top of it, not a replacement.
+    #
+    #  STRICTLY DISPLAY-ONLY. The estimate is not evidence: it never
+    #  enters the regression, never counts as a shot, and never touches
+    #  n, the slope, or Calibration Accuracy. Nothing in the engine
+    #  (analyze_latest_shot -> _forecast_rec -> _compute_forecast /
+    #  _ladder_small) calls this proc; shot 1 on a new bag still runs the
+    #  first_shot rung exactly as before. It is called only from display
+    #  paths (show_last_recommendation, show_bag_stats) and exposed for
+    #  skins, which must present it as an estimate -- the word
+    #  "Recommended" must not appear next to it.
+    #
+    #  Candidates are bags with a CONVERGED ideal grind -- the Bag Stats
+    #  Theil-Sen fit behind the v3.5.0 trust gate (4+ shots, >= 1.0 grind
+    #  spread, |slope| >= 0.5) -- on the SAME profile as the current bag.
+    #  First rung that yields data wins:
+    #    same_coffee   same bean AND roaster (a re-bought coffee; the
+    #                  loaded bag has no shots, so its roast_date is
+    #                  necessarily different) -> the most recent such
+    #                  bag's ideal grind.
+    #    same_roaster  same roaster -> median of those bags' ideals.
+    #    same_profile  any bag on this profile -> median of the
+    #                  GA_EST_BAG_WINDOW most recently used bags' ideals.
+    #    none          -> {} ; callers keep today's "-" + new-bag note.
+    #
+    #  Returns {} or a dict:
+    #    grind    estimate, rounded to grind_rounding_increment and
+    #             clamped to the grinder range
+    #    rung     same_coffee | same_roaster | same_profile
+    #    bags     how many bags fed the number
+    #    rung_txt "same roaster (4 bags)" -- short, for card lines
+    #    label    "Start ~13.5 (est. from 4 bags)"
+    #    reason   "Starting estimate: same roaster (4 bags)"
+    #    sources  labels of the source bags, most recent first
+    #
+    #  READ-ONLY (SELECTs via _bag_data). Not memoized: do not call it
+    #  from a per-tick refresh path -- it is for open-a-dialog moments.
+    # ==================================================================
+    variable GA_EST_BAG_WINDOW 6
+
+    proc starting_estimate {} {
+        variable GA_EST_BAG_WINDOW
+
+        set ck [current_bag_key]
+        if {$ck eq ""} { return {} }
+
+        set data {}
+        if {[catch { set data [_bag_data] } err]} {
+            catch { msg -ERROR "GrindAdvisor: starting_estimate failed: $err" }
+            return {}
+        }
+        if {![dict exists $data ok] || ![dict get $data ok]} { return {} }
+
+        set bv [_current_bag_values]
+        set cur_bean    [_normalize_key_parts [list [_dget $bv bean]]]
+        set cur_roaster [_normalize_key_parts [list [_dget $bv roaster]]]
+        set cur_profile [_normalize_key_parts [list [_current_profile]]]
+
+        # Candidates: converged fit, same profile, and not this bag. If the
+        # loaded bag has ANY shots the estimate does not apply -- the normal
+        # recommendation path owns the display then.
+        set cands {}
+        foreach bag [dict get $data bags] {
+            if {[dict get $bag key] eq $ck} { return {} }
+            if {![dict get $bag trusted]} { continue }
+            if {[_normalize_key_parts [list [dict get $bag profile]]] ne $cur_profile} { continue }
+            lappend cands $bag
+        }
+        if {[llength $cands] == 0} { return {} }
+
+        # First rung that yields data wins. Bags are newest-first, so the
+        # first same-coffee match is the most recent one.
+        set rung ""
+        set picked {}
+        if {$cur_bean ne "" && $cur_roaster ne ""} {
+            foreach bag $cands {
+                set bbv [dict get $bag bag_values]
+                if {[_normalize_key_parts [list [_dget $bbv bean]]] eq $cur_bean \
+                 && [_normalize_key_parts [list [_dget $bbv roaster]]] eq $cur_roaster} {
+                    set rung same_coffee
+                    set picked [list $bag]
+                    break
+                }
+            }
+        }
+        if {$rung eq "" && $cur_roaster ne ""} {
+            foreach bag $cands {
+                set bbv [dict get $bag bag_values]
+                if {[_normalize_key_parts [list [_dget $bbv roaster]]] eq $cur_roaster} {
+                    lappend picked $bag
+                }
+            }
+            if {[llength $picked] > 0} { set rung same_roaster }
+        }
+        if {$rung eq ""} {
+            set picked [lrange $cands 0 [expr {$GA_EST_BAG_WINDOW - 1}]]
+            set rung same_profile
+        }
+        if {[llength $picked] == 0} { return {} }
+
+        set ideals {}
+        set sources {}
+        foreach bag $picked {
+            lappend ideals [dict get $bag ideal]
+            lappend sources [dict get $bag label]
+        }
+        set grind [_clamp_grind [_round_grind [_median $ideals]]]
+        set nb [llength $picked]
+
+        set bag_word [expr {$nb == 1 ? "bag" : "bags"}]
+        switch -- $rung {
+            same_coffee  { set rung_txt "same coffee" }
+            same_roaster { set rung_txt "same roaster ($nb $bag_word)" }
+            default      { set rung_txt "this profile ($nb $bag_word)" }
+        }
+
+        return [dict create grind $grind rung $rung bags $nb \
+            rung_txt $rung_txt \
+            label "Start ~[_fmt_num $grind] (est. from $nb $bag_word)" \
+            reason "Starting estimate: $rung_txt" \
+            sources $sources]
+    }
+
+    # ==================================================================
     #  Per-bag recommendations (v3.8.0)
     #
     #  v3.7.0 let a skin detect that the saved recommendation belonged to a
@@ -1439,10 +1842,12 @@ namespace eval ::plugins::GrindAdvisor {
     #  _forecast_rec already takes a position and _bag_forecast_shots already
     #  filters same-bag from it.
     #
-    #  Distinct from the new-bag case and does not contradict the owner's
-    #  "reset only, no seeded number" decision (2026-08-15): that governs a
-    #  bag with NO history, which still returns {} here. This only ever shows
-    #  numbers a bag's own shots justify.
+    #  Distinct from the new-bag case: a bag with NO history still returns
+    #  {} here -- this only ever shows numbers a bag's own shots justify.
+    #  (The 2026-08-15 "reset only, no seeded number" decision that used to
+    #  govern the {} case was reversed by the owner in the v3.13.0 pass:
+    #  the shotless-bag display is now starting_estimate's job, which stays
+    #  a separate, display-only path and never flows through this proc.)
     # ==================================================================
 
     # bag_key -> rec. The skin's grind tile is re-evaluated on the app's
@@ -3577,7 +3982,7 @@ namespace eval ::plugins::GrindAdvisor {
         if {[_setting popup_theme dark] eq "light"} {
             return [dict create \
                 scrim "#F2F3F5" panel "#FFFFFF" border "#CCCCCC" \
-                text "#222222" muted "#666666" accent "#0B6E4F" \
+                text "#222222" muted "#6a6a6a" accent "#0B6E4F" \
                 btn "#EFEFEF" btnborder "#999999" btntext "#222222"]
         }
         return [dict create \
@@ -3836,19 +4241,35 @@ namespace eval ::plugins::GrindAdvisor {
     variable _bag_offset 0
     variable _bag_cards {}
     variable _bag_summary ""
+    # v3.13.0: 1 when _bag_cards leads with the starting-estimate card (which
+    # is not a bag and must not be counted as one in the toolbar).
+    variable _bag_est_present 0
 
     # Per-bag comparison cards. Returns {summary <text> cards {{l1 l2 l3}...}}.
-    proc _bag_cards_data {{max_bags 25}} {
+    # Structured per-bag data (v3.13.0): the per-bag grouping, eligibility
+    # filtering and Theil-Sen ideal-grind fit that Bag Stats has always run,
+    # extracted from _bag_cards_data so starting_estimate can read the
+    # NUMBERS instead of parsing rendered card strings. The math moved here
+    # verbatim (v3.5.0/v3.6.0 code); _bag_cards_data below renders from it
+    # and the offline harness asserts the rendered cards are byte-identical
+    # to v3.12.0's. READ-ONLY: SELECTs via locate_shot_source only.
+    #
+    # Returns {ok 0 summary <error>} or {ok 1 target <t> bags <list>}.
+    # bags is newest-first; each entry:
+    #   key label bag_values profile n excluded spread stt_txt trusted r2
+    #   newest_ts oldest_ts  + when trusted: m b ideal drift_txt
+    #                        + when not:     why
+    proc _bag_data {} {
         lassign [locate_shot_source] db table fields
         if {$db eq "" || $table eq ""} {
-            return [dict create summary "No SDB source detected." cards {}]
+            return [dict create ok 0 summary "No SDB source detected."]
         }
         if {![dict exists $fields bag_fields]} {
-            return [dict create summary "No bean/bag columns detected in SDB." cards {}]
+            return [dict create ok 0 summary "No bean/bag columns detected in SDB."]
         }
         set rows [_filter_valid_rows [_fetch_recent $db $table $fields 600] $fields]
         if {[llength $rows] == 0} {
-            return [dict create summary "No valid espresso shots found yet." cards {}]
+            return [dict create ok 0 summary "No valid espresso shots found yet."]
         }
         set target [_forecast_target]
 
@@ -3862,14 +4283,8 @@ namespace eval ::plugins::GrindAdvisor {
             dict lappend bagrows $k $r
         }
 
-        set cards {}
-        set r2_sum 0.0
-        set r2_count 0
-        set slopes {}
-        set shown 0
+        set bags {}
         foreach k $order {
-            if {$shown >= $max_bags} { break }
-            incr shown
             set brows [dict get $bagrows $k]
 
             # Label from the newest row (bean, roaster, and the profile when
@@ -3902,7 +4317,6 @@ namespace eval ::plugins::GrindAdvisor {
                 }
             }
             set n [llength $pts]
-            set ex_txt [expr {$excluded > 0 ? ", $excluded excluded" : ""}]
 
             set gmin ""; set gmax ""
             foreach p $pts {
@@ -3913,6 +4327,7 @@ namespace eval ::plugins::GrindAdvisor {
             set spread [expr {$n > 0 ? $gmax - $gmin : 0.0}]
 
             # Average-R² feed (same recency-weighted fit as the forecast).
+            set r2 ""
             if {$n >= 3} {
                 set shots {}
                 foreach p $pts {
@@ -3921,8 +4336,7 @@ namespace eval ::plugins::GrindAdvisor {
                 }
                 set reg [_weighted_regression $shots 1]
                 if {[dict get $reg ok] && [dict get $reg r2] ne ""} {
-                    set r2_sum [expr {$r2_sum + [dict get $reg r2]}]
-                    incr r2_count
+                    set r2 [dict get $reg r2]
                 }
             }
 
@@ -3945,10 +4359,20 @@ namespace eval ::plugins::GrindAdvisor {
             set fit [_theil_sen $pts]
             set trusted [expr {$n >= 4 && $spread >= 1.0 && $fit ne "" \
                 && abs([lindex $fit 0]) >= 0.5}]
+
+            set bag [dict create key $k label $label \
+                bag_values [expr {[dict exists $newest bag_values] ? [dict get $newest bag_values] : {}}] \
+                profile [string trim [_dget $newest profile]] \
+                n $n excluded $excluded spread $spread stt_txt $stt_txt \
+                trusted $trusted r2 $r2 \
+                newest_ts [_dget $newest timestamp] \
+                oldest_ts [_dget [lindex $brows end] timestamp]]
+
             if {$trusted} {
                 lassign $fit m b
-                set ideal [_clamp_grind [expr {($target - $b) / double($m)}]]
-                lappend slopes $m
+                dict set bag m $m
+                dict set bag b $b
+                dict set bag ideal [_clamp_grind [expr {($target - $b) / double($m)}]]
                 set drift_txt ""
                 if {[llength $draws] >= 6 && $t_first ne ""} {
                     set dpts {}
@@ -3966,7 +4390,7 @@ namespace eval ::plugins::GrindAdvisor {
                         }
                     }
                 }
-                set l2 "Ideal [format %.1f $ideal]  ·  Slope [format %.1f $m] s/grind$drift_txt"
+                dict set bag drift_txt $drift_txt
             } else {
                 if {$n < 4} {
                     set why "needs 4+ shots"
@@ -3975,18 +4399,52 @@ namespace eval ::plugins::GrindAdvisor {
                 } else {
                     set why "slope too flat"
                 }
-                set l2 "Fit not reliable ($why)"
+                dict set bag why $why
+            }
+            lappend bags $bag
+        }
+        return [dict create ok 1 target $target bags $bags]
+    }
+
+    proc _bag_cards_data {{max_bags 25}} {
+        set data [_bag_data]
+        if {![dict get $data ok]} {
+            return [dict create summary [dict get $data summary] cards {}]
+        }
+        set target [dict get $data target]
+
+        set cards {}
+        set r2_sum 0.0
+        set r2_count 0
+        set slopes {}
+        set shown 0
+        foreach bag [dict get $data bags] {
+            if {$shown >= $max_bags} { break }
+            incr shown
+
+            if {[dict get $bag r2] ne ""} {
+                set r2_sum [expr {$r2_sum + [dict get $bag r2]}]
+                incr r2_count
             }
 
-            set l1 $label
-            if {$n > 0} {
-                set d_new [_bag_date_short [_dget $newest timestamp]]
-                set d_old [_bag_date_short [_dget [lindex $brows end] timestamp]]
+            if {[dict get $bag trusted]} {
+                lappend slopes [dict get $bag m]
+                set l2 "Ideal [format %.1f [dict get $bag ideal]]  ·  Slope [format %.1f [dict get $bag m]] s/grind[dict get $bag drift_txt]"
+            } else {
+                set l2 "Fit not reliable ([dict get $bag why])"
+            }
+
+            set l1 [dict get $bag label]
+            if {[dict get $bag n] > 0} {
+                set d_new [_bag_date_short [dict get $bag newest_ts]]
+                set d_old [_bag_date_short [dict get $bag oldest_ts]]
                 if {$d_old ne "" && $d_new ne ""} {
                     append l1 "   [expr {$d_old eq $d_new ? $d_new : "$d_old - $d_new"}]"
                 }
             }
-            set l3 "$stt_txt  ·  $n shots$ex_txt"
+            set ex [dict get $bag excluded]
+            set ex_txt [expr {$ex > 0 ? ", $ex excluded" : ""}]
+            set l3 "[dict get $bag stt_txt]  ·  [dict get $bag n] shots$ex_txt"
             lappend cards [list $l1 $l2 $l3]
         }
 
@@ -4004,10 +4462,24 @@ namespace eval ::plugins::GrindAdvisor {
         variable _bag_offset
         variable _bag_cards
         variable _bag_summary
+        variable _bag_est_present
         set _bag_offset 0
         set data [_bag_cards_data]
         set _bag_cards [dict get $data cards]
         set _bag_summary [dict get $data summary]
+        # v3.13.0: when the loaded bag has no shots and a starting estimate
+        # exists, lead with a card naming the rung and the source bags.
+        # Display only; the toolbar counter excludes it from the bag count.
+        set _bag_est_present 0
+        set est {}
+        catch { set est [starting_estimate] }
+        if {$est ne "" && [llength $_bag_cards] > 0} {
+            set _bag_cards [linsert $_bag_cards 0 [list \
+                "Starting estimate (new bag)" \
+                "Start ~[_fmt_num [dict get $est grind]]  ·  [dict get $est rung_txt]" \
+                "From: [join [dict get $est sources] {, }]"]]
+            set _bag_est_present 1
+        }
         return [_render_bag_stats_dialog]
     }
 
@@ -4026,6 +4498,7 @@ namespace eval ::plugins::GrindAdvisor {
         variable _bag_offset
         variable _bag_cards
         variable _bag_summary
+        variable _bag_est_present
         lassign [_pgeom] parent W H o
         if {[catch {
             catch { destroy $o }
@@ -4062,6 +4535,15 @@ namespace eval ::plugins::GrindAdvisor {
             set total [llength $_bag_cards]
             if {$total == 0} {
                 set count_text "No bags found."
+            } elseif {$_bag_est_present} {
+                # v3.13.0: card 0 is the starting estimate, not a bag. Cards
+                # shown on this page are indices offset..offset+4, i.e. bags
+                # max(offset,1)..min(offset+4, nbags) since bag i is card i.
+                set nbags [expr {$total - 1}]
+                set first [expr {$_bag_offset > 0 ? $_bag_offset : 1}]
+                set last [expr {$_bag_offset + 4}]
+                if {$last > $nbags} { set last $nbags }
+                set count_text "Bags $first[format %c 0x2013]$last of $nbags"
             } else {
                 set last [expr {$_bag_offset + 5}]
                 if {$last > $total} { set last $total }
@@ -4409,7 +4891,7 @@ namespace eval ::plugins::GrindAdvisor {
         set prev_x0 [expr {$rx - 2 * $L(btn_w_std) - $L(lg)}]
         set next_x0 [expr {$rx - $L(btn_w_std)}]
         dui add dtext $page [expr {$prev_x0 - $L(lg)}] [expr {($L(bar_y0) + $L(bar_y1)) / 2}] \
-            -tags pg_ind -text "" -font $L(font_caption) -fill "#666666" -anchor e -justify right
+            -tags pg_ind -text "" -font $L(font_caption) -fill $L(text_mut) -anchor e -justify right
         dui add dbutton $page $prev_x0 $L(bar_y0) [expr {$prev_x0 + $L(btn_w_std)}] $L(bar_y1) \
             -tags pg_prev -label "[format %c 0x25C0] [translate "Prev"]" \
             -command [list ${ns}::_pg -1] -label_font $L(font_button) -style ga_btn
@@ -4515,10 +4997,20 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
 
         # Header (on the grey page background, outside any card).
         dui add dtext $page $cx $L(header_title_y) -tags page_title -text [translate "Grind Advisor"] \
-            -font $L(font_title) -width $L(content_w) -fill "#2b2b2b" -anchor center -justify center
+            -font $L(font_title) -width $L(content_w) -fill $L(text_hi) -anchor center -justify center
         dui add dtext $page $cx $L(header_subtitle_y) -tags subtitle \
             -text [translate "Reads your saved shots and recommends the next grind. Read-only."] \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor center -justify center
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor center -justify center
+
+        # v3.12.0: page-theme toggle, top-right corner of the header
+        # (sun/moon; the popup's own theme stays a separate setting).
+        set th_y1 [expr {int(($L(header_y1) - $L(btn_h)) / 2)}]
+        dui add dbutton $page [expr {$rx - $L(btn_h)}] $th_y1 \
+            $rx [expr {$th_y1 + $L(btn_h)}] \
+            -tags btn_theme -label [::plugins::GrindAdvisor::_theme_button_face] \
+            -command ::plugins::GrindAdvisor::toggle_theme \
+            -label_font [expr {$L(have_icons) ? $L(font_icon) : $L(font_button)}] \
+            -style ga_btn
 
         # v2.0.1: stock App-tab section cards, two balanced columns.
         # Precomputed content-driven heights:
@@ -4548,11 +5040,11 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
             set ry [expr {$rows_y + $row * $L(entry_row_pitch)}]
             set mid [expr {$ry + $L(entry_row_h) / 2}]
             dui add dtext $page $lab_x $mid -tags ${key}_label -text [translate $label] \
-                -font $L(font_body) -width $L(sec_label_w) -fill "#444444" -anchor w -justify left
+                -font $L(font_body) -width $L(sec_label_w) -fill $L(text_body) -anchor w -justify left
             dui add entry $page $ent_x $mid -tags $key \
                 -textvariable ::plugins::GrindAdvisor::settings($key) \
                 -width 8 -font $L(font_body) -canvas_anchor w \
-                -borderwidth 1 -bg #fbfaff -foreground #4e85f4 -relief flat
+                -borderwidth 1 -bg $L(entry_bg) -foreground $L(value_blue) -relief flat
             incr row
         }
 
@@ -4599,9 +5091,9 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
                 set ry [expr {$rows_y + $row * $L(row_pitch)}]
                 set mid [expr {$ry + $L(btn_h) / 2}]
                 dui add dtext $page $lab_x $mid -tags ${key}_label -text [translate $label] \
-                    -font $L(font_body) -width $L(sec_label_w) -fill "#444444" -anchor w -justify left
+                    -font $L(font_body) -width $L(sec_label_w) -fill $L(text_body) -anchor w -justify left
                 dui add dtext $page $val_x $mid -tags $value_tag -text "" \
-                    -font $L(font_primary) -width $val_w -fill "#4e85f4" -anchor w -justify left
+                    -font $L(font_primary) -width $val_w -fill $L(value_blue) -anchor w -justify left
                 dui add dbutton $page $btn_x1 $ry $btn_x2 [expr {$ry + $L(btn_h)}] \
                     -tags ${key}_btn -label [translate $btn_label] \
                     -command ::dui::pages::GrindAdvisor_settings::$btn_cmd \
@@ -4619,7 +5111,7 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
         set glab_x [expr {$c2x + $L(sec_pad)}]
         set gval_x [expr {$c2x + $L(sec_value_dx)}]
         dui add dtext $page $glab_x $gmid -tags conf_label -text [translate "Calibration Accuracy"] \
-            -font $L(font_body) -width $L(sec_label_w) -fill "#444444" -anchor w -justify left
+            -font $L(font_body) -width $L(sec_label_w) -fill $L(text_body) -anchor w -justify left
         set seg_y0 [expr {$gy + ($L(btn_h) - $L(conf_seg_h)) / 2}]
         set seg_y1 [expr {$seg_y0 + $L(conf_seg_h)}]
         for {set i 0} {$i < $L(conf_segments)} {incr i} {
@@ -4630,7 +5122,7 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
         set conf_text_x [expr {$gval_x + $L(conf_segments) * ($L(conf_seg_w) + $L(conf_seg_gap)) - $L(conf_seg_gap) + $L(lg)}]
         dui add dtext $page $conf_text_x $gmid -tags conf_text -text "" \
             -font $L(font_caption) -width [expr {$c2x + $col_w - $L(sec_pad) - $conf_text_x}] \
-            -fill "#444444" -anchor w -justify left
+            -fill $L(text_body) -anchor w -justify left
 
         # Bottom bar unchanged, outside any card: Done left, Advanced right.
         dui add dbutton $page $lx $L(bar_y0) [expr {$lx + $L(btn_w_std)}] $L(bar_y1) \
@@ -4662,6 +5154,9 @@ namespace eval ::dui::pages::GrindAdvisor_settings {
         catch { dui item config $page popup_theme_value -text $data(popup_theme_value) }
         catch { dui item config $page rounding_value -text $data(rounding_value) }
         catch { dui item config $page enable_popup_value -text $data(enable_popup_value) }
+        # v3.12.0: page-theme button face follows the current theme.
+        catch { dui item config $page btn_theme \
+            -label [::plugins::GrindAdvisor::_theme_button_face] }
         refresh_confidence $page
     }
 
@@ -4736,10 +5231,10 @@ namespace eval ::dui::pages::GrindAdvisor_history_options {
         set cx $L(center_x)
 
         dui add dtext $page $cx $L(header_title_y) -tags page_title -text [translate "History Display Options"] \
-            -font $L(font_title) -width $L(content_w) -fill "#2b2b2b" -anchor center -justify center
+            -font $L(font_title) -width $L(content_w) -fill $L(text_hi) -anchor center -justify center
         dui add dtext $page $cx $L(header_subtitle_y) -tags subtitle \
             -text [translate "Choose which fields each history card shows."] \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor center -justify center
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor center -justify center
 
         set i 0
         foreach {key label} {
@@ -4798,10 +5293,10 @@ namespace eval ::dui::pages::GrindAdvisor_advanced {
         set cx $L(center_x)
 
         dui add dtext $page $cx $L(header_title_y) -tags page_title -text [translate "Advanced"] \
-            -font $L(font_title) -width $L(content_w) -fill "#2b2b2b" -anchor center -justify center
+            -font $L(font_title) -width $L(content_w) -fill $L(text_hi) -anchor center -justify center
         dui add dtext $page $cx $L(header_subtitle_y) -tags version_text \
             -text "Grind Advisor $::plugins::GrindAdvisor::version \u2014 tuning and tools" \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor center -justify center
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor center -justify center
 
         # v3.0.0 section cards. The Regression Forecast method has no user
         # tuning (its constants are fixed), so only Popup Tuning remains,
@@ -4822,11 +5317,11 @@ namespace eval ::dui::pages::GrindAdvisor_advanced {
             set ry [expr {$rows_y + $row * $L(entry_row_pitch)}]
             set mid [expr {$ry + $L(entry_row_h) / 2}]
             dui add dtext $page $lab_x $mid -tags ${key}_label -text [translate $label] \
-                -font $L(font_body) -width $L(sec_label_w) -fill "#444444" -anchor w -justify left
+                -font $L(font_body) -width $L(sec_label_w) -fill $L(text_body) -anchor w -justify left
             dui add entry $page $ent_x $mid -tags $key \
                 -textvariable ::plugins::GrindAdvisor::settings($key) \
                 -width 8 -font $L(font_body) -canvas_anchor w \
-                -borderwidth 1 -bg #fbfaff -foreground #4e85f4 -relief flat
+                -borderwidth 1 -bg $L(entry_bg) -foreground $L(value_blue) -relief flat
             incr row
         }
 
@@ -4850,7 +5345,7 @@ namespace eval ::dui::pages::GrindAdvisor_advanced {
             [expr {$drows_y + $L(btn_h) + $L(md)}] -tags recalc_note \
             -text [::dui::pages::GrindAdvisor_advanced::_default_note] \
             -font $L(font_caption) -width [expr {$col_w - 2 * $L(sec_pad)}] \
-            -fill "#666666" -anchor nw -justify left
+            -fill $L(text_mut) -anchor nw -justify left
 
         # Tools card: full content width, 2x3 grid of buttons inside.
         set tools_y [expr {$L(sec_top) + $ptun_h + $L(sec_gap)}]
@@ -4928,10 +5423,10 @@ namespace eval ::dui::pages::GrindAdvisor_help {
         set cx $L(center_x)
 
         dui add dtext $page $cx $L(header_title_y) -tags page_title -text [translate "Help / Guide"] \
-            -font $L(font_title) -width $L(content_w) -fill "#2b2b2b" -anchor center -justify center
+            -font $L(font_title) -width $L(content_w) -fill $L(text_hi) -anchor center -justify center
         dui add dtext $page $cx $L(header_subtitle_y) -tags version_text \
             -text "Grind Advisor $::plugins::GrindAdvisor::version" \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor center -justify center
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor center -justify center
 
         set body [join [list \
             "Grind Advisor reads recent SDB shot data and recommends the next grinder setting after a completed espresso shot." \
@@ -4946,6 +5441,8 @@ namespace eval ::dui::pages::GrindAdvisor_help {
             "Reason strings tell you which rung was used: 'First shot', '2-shot calibration', 'Regression over N shots' (with the learned slope and predicted time), or 'Regression fallback: <why>' when there isn't enough spread to fit a line yet." \
             "Internal constants (fixed, not settings): default 3.0 s per grind step, 0.5 damping for the 1-2 shot rungs, 0.85 recency decay, 1.8 s/g dose sensitivity, 2.0 g outlier threshold, and 3 shots minimum before regression." \
             "" \
+            "New-bag starting estimate: a bag with no shots yet shows 'Start ~X (est. from N bags)' instead of nothing. The number is borrowed from bags already calibrated on the same profile, trying in order: the same coffee (same bean and roaster, an earlier bag), then the same roaster (median of its bags' ideal grinds), then this profile (median of the 6 most recently used bags). Only bags whose fit converged (the Bag Stats trust gate: 4+ shots, enough grind spread, a real slope) count; with no match the tile stays empty as before. It is an estimate, not a calibration: it never enters the regression, never counts as a shot, and Calibration Accuracy ignores it. The first real shot replaces it through the normal First shot rung." \
+            "" \
             "Calibration Accuracy is a display-only confidence score from 0 to 100. It combines evidence (how many valid shots of the same bag or recipe feed the calibration; full credit at 5) with consistency (how close those recent shots landed to your target time; a 0s average error scores full, 10s or more scores zero), weighted 40/60. Fewer than 2 relevant shots shows Not enough data, and a new bag resets the score exactly like it resets calibration. More consistent shots on the same beans raise it; erratic times or a bean change lower it. It never changes the recommendation itself." \
             "" \
             "Dose / Yield Source (Advanced) chooses which dose and yield the plugin reports. Fixed uses your set dose and target yield. Actual uses the measured dose and final yield when present. Auto (default) uses measured values only when they pass plausibility (dose within Dose min/max, ratio within Ratio min/max), otherwise it falls back to the set values; a missing or zero measurement always falls back. The popup, reason line, and Diagnostics always state which source was used, e.g. 'dose: actual 18.4g' or 'dose: set 18.0g (actual 0.0g rejected)'. The grind recommendation is based on shot time only, so this choice never changes the recommended grind."] "\n"]
@@ -4958,7 +5455,7 @@ namespace eval ::dui::pages::GrindAdvisor_help {
         # v3.6.0: text is paginated (the full guide is ~2 cards tall and
         # used to clip under the bottom bar); Prev/Next flip pages.
         dui add dtext $page [expr {$lx + $L(sec_pad)}] $rows_y -tags help_text -text "" \
-            -font $L(font_body) -width [expr {$L(content_w) - 2 * $L(sec_pad)}] -fill "#444444" -anchor nw -justify left
+            -font $L(font_body) -width [expr {$L(content_w) - 2 * $L(sec_pad)}] -fill $L(text_body) -anchor nw -justify left
 
         dui add dbutton $page $lx $L(bar_y0) [expr {$lx + $L(btn_w_std)}] $L(bar_y1) \
             -tags page_done -label [translate "Done"] \
@@ -5009,15 +5506,15 @@ namespace eval ::dui::pages::GrindAdvisor_diagnostics {
         set cx $L(center_x)
 
         dui add dtext $page $cx $L(header_title_y) -tags page_title -text [translate "Diagnostics"] \
-            -font $L(font_title) -width $L(content_w) -fill "#2b2b2b" -anchor center -justify center
+            -font $L(font_title) -width $L(content_w) -fill $L(text_hi) -anchor center -justify center
         dui add dtext $page $cx $L(header_subtitle_y) -tags subtitle \
             -text [translate "Detected SDB source and columns. Read-only."] \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor center -justify center
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor center -justify center
 
         set card_h [expr {$L(bar_y0) - $L(md) - $L(sec_top)}]
         set rows_y [::plugins::GrindAdvisor::_sec_card $page sec_diag $lx $L(sec_top) $L(content_w) $card_h "Detected Fields"]
         dui add dtext $page [expr {$lx + $L(sec_pad)}] $rows_y -tags diagnostics_text -text "" \
-            -font $L(font_body) -width [expr {$L(content_w) - 2 * $L(sec_pad)}] -fill "#444444" -anchor nw -justify left
+            -font $L(font_body) -width [expr {$L(content_w) - 2 * $L(sec_pad)}] -fill $L(text_body) -anchor nw -justify left
 
         dui add dbutton $page $lx $L(bar_y0) [expr {$lx + $L(btn_w_std)}] $L(bar_y1) \
             -tags page_done -label [translate "Done"] \
@@ -5069,17 +5566,17 @@ namespace eval ::dui::pages::GrindAdvisor_calculation_details {
         set cx $L(center_x)
 
         dui add dtext $page $cx $L(header_title_y) -tags page_title -text [translate "Calculation Details"] \
-            -font $L(font_title) -width $L(content_w) -fill "#2b2b2b" -anchor center -justify center
+            -font $L(font_title) -width $L(content_w) -fill $L(text_hi) -anchor center -justify center
         dui add dtext $page $cx $L(header_subtitle_y) -tags subtitle \
             -text [translate "How the latest recommendation was computed. Read-only."] \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor center -justify center
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor center -justify center
 
         set card_h [expr {$L(bar_y0) - $L(md) - $L(sec_top)}]
         set rows_y [::plugins::GrindAdvisor::_sec_card $page sec_calcd $lx $L(sec_top) $L(content_w) $card_h "Latest Calculation"]
         # v2.2.0: caption font so the per-shot trace fits below the summary
         # block without overflowing the card.
         dui add dtext $page [expr {$lx + $L(sec_pad)}] $rows_y -tags calculation_text -text "" \
-            -font $L(font_caption) -width [expr {$L(content_w) - 2 * $L(sec_pad)}] -fill "#444444" -anchor nw -justify left
+            -font $L(font_caption) -width [expr {$L(content_w) - 2 * $L(sec_pad)}] -fill $L(text_body) -anchor nw -justify left
 
         dui add dbutton $page $lx $L(bar_y0) [expr {$lx + $L(btn_w_std)}] $L(bar_y1) \
             -tags page_done -label [translate "Done"] \
@@ -5132,10 +5629,10 @@ namespace eval ::dui::pages::GrindAdvisor_dose_yield {
         set lx $L(left_x); set rx $L(right_x); set cx $L(center_x)
 
         dui add dtext $page $cx $L(header_title_y) -tags page_title -text [translate "Dose / Yield Source"] \
-            -font $L(font_title) -width $L(content_w) -fill "#2b2b2b" -anchor center -justify center
+            -font $L(font_title) -width $L(content_w) -fill $L(text_hi) -anchor center -justify center
         dui add dtext $page $cx $L(header_subtitle_y) -tags subtitle \
             -text [translate "Whether recommendations report set or measured dose and yield."] \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor center -justify center
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor center -justify center
 
         # One full-width card: mode selector row, then the 4 bounds in two
         # columns (all entry centers land above y=800, the top half).
@@ -5150,10 +5647,10 @@ namespace eval ::dui::pages::GrindAdvisor_dose_yield {
         set btn_x2 [expr {$rx - $L(sec_pad)}]
         set btn_x1 [expr {$btn_x2 - $L(btn_w_std)}]
         dui add dtext $page [expr {$lx + $L(sec_pad)}] $mid -tags mode_label -text [translate "Dose / yield mode"] \
-            -font $L(font_body) -width $L(sec_label_w) -fill "#444444" -anchor w -justify left
+            -font $L(font_body) -width $L(sec_label_w) -fill $L(text_body) -anchor w -justify left
         dui add dtext $page [expr {$lx + $L(sec_value_dx)}] $mid -tags mode_value -text "" \
             -font $L(font_primary) -width [expr {$btn_x1 - $L(lg) - ($lx + $L(sec_value_dx))}] \
-            -fill "#4e85f4" -anchor w -justify left
+            -fill $L(value_blue) -anchor w -justify left
         dui add dbutton $page $btn_x1 $rows_y $btn_x2 [expr {$rows_y + $L(btn_h)}] \
             -tags mode_btn -label [translate "Next"] \
             -command ::dui::pages::GrindAdvisor_dose_yield::cycle_mode \
@@ -5175,16 +5672,16 @@ namespace eval ::dui::pages::GrindAdvisor_dose_yield {
             set ry [expr {$entries_top + $r * $L(entry_row_pitch)}]
             set emid [expr {$ry + $L(entry_row_h) / 2}]
             dui add dtext $page $label_x $emid -tags ${key}_label -text [translate $label] \
-                -font $L(font_body) -width $L(sec_label_w) -fill "#444444" -anchor w -justify left
+                -font $L(font_body) -width $L(sec_label_w) -fill $L(text_body) -anchor w -justify left
             dui add entry $page $entry_x $emid -tags $key \
                 -textvariable ::plugins::GrindAdvisor::settings($key) \
                 -width 8 -font $L(font_body) -canvas_anchor w \
-                -borderwidth 1 -bg #fbfaff -foreground #4e85f4 -relief flat
+                -borderwidth 1 -bg $L(entry_bg) -foreground $L(value_blue) -relief flat
         }
 
         set cap_y [expr {$L(sec_top) + $card_h + $L(sec_gap)}]
         dui add dtext $page $lx $cap_y -tags dy_help -width $L(content_w) \
-            -font $L(font_caption) -fill "#666666" -anchor nw -justify left \
+            -font $L(font_caption) -fill $L(text_mut) -anchor nw -justify left \
             -text [translate "Fixed always uses your set dose and target yield. Actual uses the measured dose and final yield when present. Auto uses measured values only when the dose is within Dose min/max and the ratio (yield/dose) is within Ratio min/max, otherwise it falls back to the set values; a missing or zero measurement always falls back. Plausibility bounds apply to Auto only. This choice affects what the popup, reason line, and Diagnostics report; it does not change the grind recommendation itself."]
 
         dui add dbutton $page $lx $L(bar_y0) [expr {$lx + $L(btn_w_std)}] $L(bar_y1) \

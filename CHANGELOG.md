@@ -1,5 +1,125 @@
 # Grind Advisor — Changelog
 
+## v3.13.1 (a cleaning profile no longer blanks the recommendation) — 2026-08-31 — TABLET-VERIFIED 2026-08-31
+
+**Safety status: read-only, unchanged. No write behavior exists beyond the
+v3.9.0 SDB resync button. One identity guard in `current_bag_key`; no
+recommendation math touched.**
+
+Owner report: running the **"Cleaning/Forward Flush x5"** profile made the
+skin's grind tile drop to "-" / "Pull a shot on this bag". Cause: with
+profile segmentation on, `current_bag_key` composed *bean + cleaning
+profile* — a "bag" with no shots — so `recommendation_for_current_bag`
+returned nothing. The cleaning rows themselves never touched the math
+(`_row_is_valid_espresso` already rejects them); this was purely the live
+identity key.
+
+* `current_bag_key` now answers `""` (the documented identity-indeterminate
+  value) when segmentation is on and the live `profile_title` matches the
+  same `_text_is_nonespresso` keyword gate that keeps cleaning/rinse/flush
+  rows out of the evidence — no second keyword list. Every consumer then
+  falls back to its existing fail-safe: `last_recommendation_is_current`
+  answers 1, `recommendation_for_current_bag` hands back the saved
+  recommendation (the number stays on the tile through the cleaning
+  session), and `starting_estimate` stays silent. Switching back to an
+  espresso profile restores the normal per-bag path.
+* Guarded to segmentation-ON only: with `segment_by_profile` off, the
+  bean-only key still matches the bag's shots and there was no bug.
+* Known cosmetic corner: pressing Recalculate while a cleaning profile is
+  loaded reports "no bean set, nothing to recompute" — accurate enough
+  (identity is indeterminate), recompute after switching back.
+* Harness grew to 58 checks: the tablet's exact profile string, the other
+  gate keywords (backflush, rinse, descale, hot water), an espresso title
+  still composing the full key, segmentation-off behavior, the saved-rec
+  fail-safes — and a repro check proving v3.12.0 builds the blank-tile key
+  the fix removes. No Lumen change needed: the tile follows
+  `recommendation_for_current_bag`.
+
+## v3.13.0 (new-bag starting estimate) — 2026-08-29 — TABLET-VERIFIED 2026-08-29
+
+**Safety status: read-only, unchanged. No write behavior exists beyond the
+v3.9.0 SDB resync button; the estimate path issues only the existing
+Bag Stats SELECTs.**
+
+**Owner-decision reversal, recorded:** this pass deliberately reverses the
+2026-08-15 decision *"reset only, never seed a guessed grind for a new bag"*
+(previously recorded at the `show_last_recommendation` comment). Reversed by
+the owner in the v3.13.0 pass spec (2026-08-29). The v3.7.0 bag-key reset
+itself stays — the estimate is layered on top of it, not a replacement.
+
+A freshly scanned bag used to show only "-" and *"New bag - pull a shot to
+calibrate"*, making the first shot a blind guess. Now:
+
+* **`starting_estimate` (new public proc)** returns a display-only starting
+  grind for a bag with **no shots yet**, borrowed from bags whose Bag Stats
+  Theil-Sen fit **converged** (the v3.5.0 trust gate: 4+ shots, ≥ 1.0 grind
+  spread, |slope| ≥ 0.5) **on the same profile**. First rung that yields
+  data wins: `same_coffee` (same bean + roaster, i.e. a re-bought coffee →
+  the most recent such bag's ideal grind), `same_roaster` (median of that
+  roaster's bags' ideals), `same_profile` (median of the 6 most recently
+  used bags' ideals — internal constant, documented in Help), else empty and
+  everything behaves exactly as v3.12.0. Median, not mean; rounded to the
+  grind rounding increment and clamped to the grinder range.
+* **The estimate is not evidence.** It never enters the regression, never
+  counts as a shot, and never touches n, the slope, or Calibration
+  Accuracy. Its only callers are display paths (`show_last_recommendation`,
+  `show_bag_stats`) — the engine
+  (`analyze_latest_shot → _forecast_rec → _compute_forecast/_ladder_small`)
+  has no path to it, so shot 1 on a new bag still runs the unchanged
+  first-shot rung, and the ladder math (damping 0.5, decay 0.85, dose
+  sensitivity 1.8 s/g, outlier 2.0 g) is untouched.
+* **Popup**: for a bag with no shots, the result card now leads with
+  `Start ~13.5 (est. from 4 bags)`, keeps the new-bag note as the second
+  line, then the reason (`Starting estimate: same coffee` / `same roaster
+  (4 bags)` / `this profile (6 bags)`). The word "Recommended" never
+  appears next to an estimate (estimates render only on the ok-0 card,
+  which has no "Recommended Next Grind" line, and `present_result` never
+  saves ok-0 dicts, so the estimate cannot overwrite the saved
+  recommendation).
+* **Bag Stats**: when the loaded bag has no shots and an estimate exists, a
+  leading card names the rung and the source bags; the "Bags x–y of N"
+  counter excludes that card from the bag count.
+* **Help** gained a paragraph explaining the ladder, the 6-bag window, and
+  that an estimate is not a calibration.
+* Plumbing: the per-bag grouping + Theil-Sen ideal computation moved
+  verbatim from `_bag_cards_data` into a structured `_bag_data` helper
+  (cards render from it unchanged — the offline harness asserts v3.12.0
+  and v3.13.0 produce byte-identical Bag Stats cards); `current_bag_key`
+  split into `_current_bag_values`/`_current_profile` so the estimate can
+  match bean/roaster field-by-field (composed keys drop empty segments and
+  cannot be parsed back). Skins keep reading
+  `recommendation_for_current_bag` exactly as before — it still returns
+  `{}` for a shotless bag; the Lumen tile picks up `starting_estimate` in
+  its own later pass.
+* Offline harness `verify_ga_v3130.tcl`: 47 checks — refactor equivalence
+  against the archived v3.12.0, the estimate ladder/rounding/clamping/
+  guards, both display paths, byte-compile of all 206 procs, and
+  nothing-new sweeps for color literals, SQL write keywords, and file
+  writes.
+
+## v3.12.0 (page dark mode) — 2026-08-28
+
+**Safety status: read-only, unchanged.** The one new persisted value is
+`theme` (light | dark) in the plugin's own settings, saved on each
+explicit toggle tap.
+
+- A sun/moon button in the settings page's top-right corner switches
+  all seven dui pages between a light and a dark palette instantly; the
+  choice persists across restarts. This is separate from **Popup
+  theme**, which keeps its own light/dark for the after-shot popup and
+  the History / Bag Stats overlays exactly as before — the two can
+  disagree on purpose (e.g. dark popup over light pages).
+- Every color the pages paint moved from scattered literals into one
+  `_apply_palette` proc (the offline harness enforces that no palette
+  literal appears anywhere else — the popup's independent `_colors`
+  dict excluded). The repaint walk covers page backgrounds, section
+  cards, all label/value/help texts, the nine numeric entries, the ten
+  History Display Options checkboxes (box + label), the calibration
+  gauge (its fill/empty colors are palette tokens, recolored live by
+  the existing refresh), and every button face. A restart in dark
+  runs one retheme pass after page creation so the checkbox colors
+  (framework defaults at creation) come up dark too.
+
 ## v3.11.1 (normalization only trusts plausible actuals) — 2026-08-24
 
 **Safety status: read-only, unchanged. No write behavior exists beyond the
