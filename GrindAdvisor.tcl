@@ -3064,13 +3064,260 @@ namespace eval ::plugins::GrindAdvisor {
         return $text
     }
 
+    # ==================================================================
+    #  Frosted-glass popup (v3.14.0, reworked v3.14.1) -- skin-provided
+    #  material, opaque fallback everywhere else.
+    #
+    #  When the active skin offers a glass material (Lumen 0.39.0's
+    #  ::lumen::glass_material), the after-shot popup renders as an
+    #  iOS-style frosted card: a crop of the skin's pre-blurred slab (Tk
+    #  has no runtime blur/alpha, so it is a baked PNG on the skin side),
+    #  with corners rounded by setting the outside-the-arc pixels
+    #  transparent.
+    #
+    #  v3.14.1: the overlay covers ONLY THE CARD. v3.14.0 covered the
+    #  whole screen and painted the skin's baked art as the scrim -- but
+    #  the bake has no live text or chart (those are drawn by the app on
+    #  top of the background), so the owner saw "empty placeholder
+    #  blocks". Neither the app nor AndroWish can photograph the live
+    #  screen, so the fix is architectural: shrink the overlay to the
+    #  card's rect and the REAL page -- live numbers, chart, all of it --
+    #  stays visible around the glass. Modality is kept with a Tk grab on
+    #  the overlay (see _glass_grab); the skin's dim asset is no longer
+    #  consumed (still validated -- it is part of the provider contract).
+    #
+    #  OPAQUE FALLBACK IS THE RULE (owner requirement): no glass_material
+    #  proc (any other skin), material {} (not on the home page, missing
+    #  or wrong-resolution assets), unreadable files, or ANY error while
+    #  loading or presenting -- every path lands on the exact v3.13.x
+    #  full-screen opaque popup. Layout, buttons, popup_active guarding
+    #  and navigation are shared: glass only changes what the card sits
+    #  on and how much screen the overlay claims.
+    #
+    #  Text colors follow the MATERIAL's theme via the _colors override
+    #  (light text on the dark slab); the Popup theme setting keeps
+    #  governing the opaque popup and the Why?/Curve/History overlays,
+    #  which stay opaque (and full-screen) in this pass.
+    # ==================================================================
+    variable _glass_mat {}
+    variable _glass_slab_src ""
+    variable _glass_bg_src ""
+    variable _glass_photos {}
+
+    proc _glass_cleanup {} {
+        variable _glass_mat
+        variable _glass_slab_src
+        variable _glass_bg_src
+        variable _glass_photos
+        foreach im $_glass_photos { catch { image delete $im } }
+        set _glass_photos {}
+        set _glass_slab_src ""
+        set _glass_bg_src ""
+        set _glass_mat {}
+    }
+
+    # Tk grab keeps the card-only overlay modal: pointer events outside
+    # the card are swallowed instead of landing on the live controls
+    # beneath (a stray tap must not nudge a grind stepper or open the
+    # camera). Release is layered: destroying the overlay auto-releases
+    # its grab (Tk semantics), _close_dialog ungrabs explicitly first,
+    # and _nav_state_change closes the dialog the moment any flow starts
+    # -- the same path that already tore the popup down pre-glass. `grab
+    # set` fails while a freshly placed window is not yet viewable, so it
+    # is retried on the same delayed ticks that re-raise the overlay; if
+    # it never lands the popup is simply not modal for that one showing
+    # -- degrade, never block.
+    proc _glass_grab {o} {
+        catch { grab set $o }
+        after 200 [list catch [list grab set $o]]
+        after 600 [list catch [list grab set $o]]
+    }
+
+    proc _glass_ungrab {} {
+        catch {
+            set g [grab current]
+            if {$g ne "" && [string match "*grindadvisor_overlay*" $g]} {
+                grab release $g
+            }
+        }
+    }
+
+    # The material dict from the active skin, or {}. Trust but verify:
+    # every field this plugin consumes is checked before use.
+    proc _glass_material {} {
+        if {[info procs ::lumen::glass_material] eq ""} { return {} }
+        set m {}
+        if {[catch { set m [::lumen::glass_material] } err]} {
+            catch { msg "GrindAdvisor: glass_material failed: $err" }
+            return {}
+        }
+        if {$m eq "" || [catch { dict size $m }]} { return {} }
+        if {![dict exists $m ok] || ![dict get $m ok]} { return {} }
+        # bg (the plain page art, v3.14.4) is required: the card's seam-free
+        # ring is built from it. A provider without it (Lumen 0.39.0) gets
+        # the opaque popup rather than the seamed glass it would produce.
+        foreach k {glass bg theme} {
+            if {![dict exists $m $k]} { return {} }
+        }
+        foreach k {glass bg} {
+            if {![file exists [dict get $m $k]]} { return {} }
+        }
+        return $m
+    }
+
+    # Load and validate the slab for this draw. Returns 1 with
+    # _glass_mat/_glass_slab_src set, or 0 with everything cleaned -- the
+    # caller then renders the opaque popup unchanged. The size check is
+    # strict: the consumer crops in physical pixels and a mismatched
+    # image would put the wrong art under the card.
+    proc _glass_setup {W H} {
+        variable _glass_mat
+        variable _glass_slab_src
+        variable _glass_bg_src
+        variable _glass_photos
+        _glass_cleanup
+        set m [_glass_material]
+        if {$m eq ""} { return 0 }
+        if {[catch {
+            set slab [image create photo -file [dict get $m glass]]
+            lappend _glass_photos $slab
+            set bg [image create photo -file [dict get $m bg]]
+            lappend _glass_photos $bg
+            if {[image width $slab] != $W || [image height $slab] != $H \
+             || [image width $bg] != $W || [image height $bg] != $H} {
+                error "material is [image width $slab]x[image height $slab] / [image width $bg]x[image height $bg], overlay is ${W}x${H}"
+            }
+            set _glass_slab_src $slab
+            set _glass_bg_src $bg
+            set _glass_mat $m
+        } err]} {
+            catch { msg "GrindAdvisor: glass disabled for this draw: $err" }
+            _glass_cleanup
+            return 0
+        }
+        return 1
+    }
+
+    # Present the glass card inside a seam-free ART RING (v3.14.4).
+    #
+    #  Every earlier attempt to color the overlay's boundary -- one
+    #  sampled -bg (v3.14.1), per-corner sampled rects (v3.14.3) -- still
+    #  read as a hard cliff on-tablet, because ANY guessed color
+    #  mismatches the live page somewhere along the edge. So stop
+    #  guessing: the overlay now extends a margin ring beyond the card
+    #  and paints that ring (in fact its whole base layer) with the
+    #  skin's PLAIN page background, cropped at the identical screen
+    #  coordinates. The page beneath IS that art plus live text, so the
+    #  canvas boundary lands on pixel-identical art and disappears; the
+    #  card's transparent corners reveal genuine local art; every edge
+    #  transition happens inside the canvas, against matching pixels.
+    #
+    #  The slab crop, transparency-rounded corners, double-radius border
+    #  (the -smooth 1 half-curvature lesson) and grab are unchanged.
+    #  Returns the card-local origin {mx my} for the caller.
+    proc _glass_present {o parent sx0 sy0 cw ch radius col} {
+        variable _glass_slab_src
+        variable _glass_bg_src
+        variable _glass_photos
+
+        # Margin ring: 24px, clamped so the overlay never leaves the
+        # screen (the bg image's size IS the screen's).
+        set W [image width $_glass_bg_src]
+        set H [image height $_glass_bg_src]
+        set M 24
+        foreach lim [list $sx0 $sy0 [expr {$W - ($sx0 + $cw)}] [expr {$H - ($sy0 + $ch)}]] {
+            if {$lim < $M} { set M $lim }
+        }
+        if {$M < 0} { set M 0 }
+        set ox [expr {$sx0 - $M}]
+        set oy [expr {$sy0 - $M}]
+        set ow [expr {$cw + 2 * $M}]
+        set oh [expr {$ch + 2 * $M}]
+
+        # place MERGES options across calls (v3.14.2, seen on-tablet): the
+        # overlay was first placed -relwidth 1 -relheight 1, and Tk SUMS
+        # -width with -relwidth*parent, so re-placing without a forget left
+        # a card-positioned canvas the size of the whole screen PLUS the
+        # card -- it blacked out everything right and below the card.
+        # Forget first: the new placement then carries only these options.
+        place forget $o
+        place $o -in $parent -x $ox -y $oy -width $ow -height $oh
+
+        # Base layer: the page's own art at these exact coordinates.
+        set ring [image create photo]
+        lappend _glass_photos $ring
+        $ring copy $_glass_bg_src -from $ox $oy [expr {$ox + $ow}] [expr {$oy + $oh}]
+        $o create image 0 0 -anchor nw -image $ring -tags gad
+
+        set card [image create photo]
+        lappend _glass_photos $card
+        $card copy $_glass_slab_src -from $sx0 $sy0 [expr {$sx0 + $cw}] [expr {$sy0 + $ch}]
+        set r $radius
+        for {set i 0} {$i < $r} {incr i} {
+            for {set j 0} {$j < $r} {incr j} {
+                set dx [expr {$r - 0.5 - $i}]
+                set dy [expr {$r - 0.5 - $j}]
+                if {$dx * $dx + $dy * $dy <= $r * $r} { continue }
+                $card transparency set $i $j 1
+                $card transparency set [expr {$cw - 1 - $i}] $j 1
+                $card transparency set $i [expr {$ch - 1 - $j}] 1
+                $card transparency set [expr {$cw - 1 - $i}] [expr {$ch - 1 - $j}] 1
+            }
+        }
+        $o create image $M $M -anchor nw -image $card -tags gad
+        _opoly $o $M $M [expr {$M + $cw}] [expr {$M + $ch}] [expr {$radius * 2}] "" [dict get $col border] gad
+        _glass_grab $o
+        return [list $M $M]
+    }
+
+    # What the card sits on -- ONE call site per card so glass and opaque
+    # can never diverge. Glass shrinks the overlay to the card plus its
+    # art ring and hands back CARD-LOCAL coordinates for all the text
+    # that follows; any glass failure logs, restores the full-screen
+    # overlay, drops the grab, and paints the v3.13.x opaque panel with
+    # the original coordinates. Returns {x0 y0 x1 y1 cx}; may clear the
+    # caller's glass flag (passed by name).
+    proc _present_card {o parent glassvar x0 y0 x1 y1 radius col} {
+        upvar 1 $glassvar glass
+        if {$glass} {
+            set cw [expr {$x1 - $x0}]
+            set ch [expr {$y1 - $y0}]
+            if {![catch { _glass_present $o $parent $x0 $y0 $cw $ch $radius $col } m]} {
+                lassign $m mx my
+                return [list $mx $my [expr {$mx + $cw}] [expr {$my + $ch}] \
+                    [expr {$mx + int($cw / 2)}]]
+            }
+            set err $m
+            catch { msg "GrindAdvisor: glass card failed, using opaque: $err" }
+            set glass 0
+            _glass_ungrab
+            catch { $o delete gad }
+            catch { $o configure -bg [dict get $col scrim] }
+            # forget first -- place merges options (see _glass_present), and
+            # -relwidth 1 on top of a leftover -width would oversize it here
+            # exactly as it did there.
+            place forget $o
+            place $o -in $parent -x 0 -y 0 -relwidth 1 -relheight 1
+        }
+        _opoly $o $x0 $y0 $x1 $y1 $radius [dict get $col panel] [dict get $col border] gad
+        return [list $x0 $y0 $x1 $y1 [expr {int(($x0 + $x1) / 2)}]]
+    }
+
     proc _show_overlay_dialog {rec} {
         variable _last_rec_shown
+        variable _glass_mat
+        variable _colors_override
         lassign [_pgeom] parent W H o
 
         set ok 1
         if {[catch {
             catch { destroy $o }
+            # v3.14.0: glass when the skin offers the material; the whole
+            # draw then follows the MATERIAL's theme, not popup_theme --
+            # via the draw-scoped override, so helpers that fetch their
+            # own colors (_obutton) agree too (v3.14.5).
+            set glass [_glass_setup $W $H]
+            set _colors_override [expr {$glass ? [dict get $_glass_mat theme] : ""}]
             set col [_colors]
             set F [_pfonts $H]
             set fsec  [dict get $F section]
@@ -3079,7 +3326,9 @@ namespace eval ::plugins::GrindAdvisor {
             set fcap  [dict get $F caption]
             set fbtn  [dict get $F button]
 
-            # Neutral theme scrim; the card floats centered on it.
+            # Neutral theme scrim; the card floats centered on it. With
+            # glass, _present_card re-places this canvas over just the
+            # card's rect, so the live page stays visible around it.
             canvas $o -bg [dict get $col scrim] -highlightthickness 0 -bd 0 \
                 -takefocus 0
             place $o -in $parent -x 0 -y 0 -relwidth 1 -relheight 1
@@ -3168,7 +3417,8 @@ namespace eval ::plugins::GrindAdvisor {
                 set y1 [expr {$y0 + $ch}]
                 set cx [expr {int(($x0 + $x1) / 2)}]
 
-                _opoly $o $x0 $y0 $x1 $y1 $radius [dict get $col panel] [dict get $col border] gad
+                lassign [_present_card $o $parent glass $x0 $y0 $x1 $y1 $radius $col] \
+                    x0 y0 x1 y1 cx
 
                 set y [expr {$y0 + $pad}]
                 _otext $o $cx [expr {$y + $fsec / 2}] center "\u2713 Shot Saved" $fsec [dict get $col text] $inner center bold
@@ -3242,7 +3492,8 @@ namespace eval ::plugins::GrindAdvisor {
                 set y1 [expr {$y0 + $ch}]
                 set cx [expr {int(($x0 + $x1) / 2)}]
 
-                _opoly $o $x0 $y0 $x1 $y1 $radius [dict get $col panel] [dict get $col border] gad
+                lassign [_present_card $o $parent glass $x0 $y0 $x1 $y1 $radius $col] \
+                    x0 y0 x1 y1 cx
 
                 set y [expr {$y0 + $pad}]
                 _otext $o $cx [expr {$y + $fsec / 2}] center "\u26A0 Grind Advisor" $fsec [dict get $col text] $inner center bold
@@ -3269,6 +3520,9 @@ namespace eval ::plugins::GrindAdvisor {
             catch { msg "GrindAdvisor: overlay dialog failed: $err" }
             set ok 0
         }
+        # The material palette is scoped to THIS draw; the sub-dialogs
+        # (Why?/Curve/History) keep following popup_theme.
+        set _colors_override ""
         return $ok
     }
 
@@ -3978,8 +4232,28 @@ namespace eval ::plugins::GrindAdvisor {
     # ::plugins::GrindAdvisor::settings(popup_theme) to "light" for a light one.
     # One layout, two color sets (v2.0.0 added the "muted" secondary text
     # color; everything else unchanged).
-    proc _colors {} {
-        if {[_setting popup_theme dark] eq "light"} {
+    #
+    # v3.14.0: optional theme override. The glass popup must follow the
+    # MATERIAL's theme (light text on a dark slab and vice versa), so a
+    # glass draw passes the skin's theme here; the Popup theme setting
+    # keeps governing the opaque popup and every other overlay.
+    #
+    # v3.14.5: the override is also a DRAW-SCOPED variable, because
+    # helpers like _obutton call _colors themselves -- on the tablet the
+    # light-material popup rendered dark buttons (owner screenshot,
+    # light theme). _show_overlay_dialog sets _colors_override for the
+    # duration of a glass draw and clears it before returning (and
+    # _close_dialog clears it again, belt and braces), so every helper
+    # in that draw agrees on the material's palette while the
+    # Why?/Curve/History overlays keep following popup_theme.
+    variable _colors_override ""
+
+    proc _colors {{override ""}} {
+        variable _colors_override
+        if {$override eq ""} { set override $_colors_override }
+        set t [_setting popup_theme dark]
+        if {$override in {light dark}} { set t $override }
+        if {$t eq "light"} {
             return [dict create \
                 scrim "#F2F3F5" panel "#FFFFFF" border "#CCCCCC" \
                 text "#222222" muted "#6a6a6a" accent "#0B6E4F" \
@@ -3993,6 +4267,12 @@ namespace eval ::plugins::GrindAdvisor {
 
     proc _close_dialog {} {
         variable popup_active
+        variable _colors_override
+        set _colors_override ""
+        # Release the glass grab first (v3.14.1); destroying the overlay
+        # would release it too (Tk drops a destroyed window's grab), this
+        # is belt and braces.
+        catch { _glass_ungrab }
         # Destroy the overlay widget wherever it was parented.
         catch { destroy .grindadvisor_overlay }
         set sc [_get_canvas]
@@ -4002,6 +4282,10 @@ namespace eval ::plugins::GrindAdvisor {
             catch { $sc delete grindadvisor_dialog }
         }
         catch { destroy .grindadvisor }
+        # Drop the glass photos (v3.14.0) AFTER the widgets that showed
+        # them are gone -- they are the only thing an overlay leaves
+        # behind.
+        catch { _glass_cleanup }
         set popup_active 0
     }
 

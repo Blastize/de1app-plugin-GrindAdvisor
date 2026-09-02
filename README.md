@@ -1,9 +1,14 @@
-# Grind Advisor v3.13.1
+# Grind Advisor v3.14.5
 
-Current plugin version: **v3.13.1** — loading a cleaning / flush / rinse
+Current plugin version: **v3.14.5** — on skins that provide a glass
+material (Lumen 0.39.0+), the after-shot popup renders as an iOS-style
+frosted card floating over the live home screen (the page stays visible
+around it; a grab keeps the popup modal). On every other skin — or
+whenever the material is unavailable — the popup is exactly the
+full-screen opaque card it always was. Previous (v3.13.1): loading a cleaning / flush / rinse
 profile no longer blanks the recommendation: a non-espresso profile is not
 a bag identity, so the saved number stays on screen until you switch back
-to a real espresso profile. Previous (v3.13.0): a freshly scanned bag with no shots
+to a real espresso profile. (v3.13.0): a freshly scanned bag with no shots
 now shows a data-derived **starting estimate** ("Start ~13.5 (est. from 4
 bags)") borrowed from already-calibrated bags on the same profile, instead
 of only "-" and the new-bag note. Display-only: it never feeds the
@@ -15,7 +20,27 @@ A DE1app (Decent Espresso) plugin. After every completed espresso shot it
 reads your latest shot from **SDB** and shows a popup recommending your next
 grind setting. You enter nothing by hand.
 
-![The after-shot popup](images/shot-analysis-popup.jpg)
+```
+┌───────────────────────────────────┐
+│            ✓ Shot Saved           │
+│                                   │
+│           13.5 → 13.0             │
+│           coarser by 0.5          │
+│                                   │
+│   Time        26.8s (target 28s)  │
+│   Dose        18.0g               │
+│   Yield       36.0g               │
+│   Ratio       1:2.0               │
+│   Bag Shot    #6                  │
+│                                   │
+│   Reason                          │
+│   Regression over 6 shots (slope  │
+│   -4.1 s/grind, predicts 28.0s    │
+│   at 13.0).                       │
+│                                   │
+│ [ OK ] [ Why? ] [ Curve ] [ Hist ]│
+└───────────────────────────────────┘
+```
 
 Dose, Yield, and Ratio lines appear automatically when those columns exist in
 SDB; if they aren't stored, those lines are simply omitted.
@@ -25,7 +50,30 @@ SDB; if they aren't stored, those lines are simply omitted.
 **Curve** shows what the recommendation is actually standing on. **Back**
 returns to the popup.
 
-![The Calibration Curve](images/calibration-curve.jpg)
+```
+┌─────────────────────────────────────────┐
+│           Calibration Curve             │
+│  30 ┃  ·                                │
+│     ┃╲   ·        ┆      target 28s     │
+│  ‥‥‥┃‥‥╲‥‥‥‥‥‥‥‥‥‥┆‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥‥ │
+│     ┃    ╲ ·   ·  ┆                     │
+│  22 ┗━┿━━━━┿━━━━┿━━━━┿━━━━┿━━━━┿━━━━━━  │
+│     time (normalized), s                │
+│ +1.2┃ ┆    ┆  │ ┆    ┆ │  ┆             │
+│   0 ┠─┼────┼──┬─┼────┼─┴──┼─────────    │
+│     ┃ ┆    ┆  │ ┆    ┆    ┆             │
+│       8   8.5  9   9.5  10   10.5       │
+│     residuals, s        grind setting → │
+│                                         │
+│  R² 0.996  ·  bias +0.01s  ·  spread    │
+│  ±0.09s  ·  n=6                         │
+│  Residuals are small and evenly spread  │
+│  about the line: this calibration is    │
+│  behaving.                              │
+│                                         │
+│      [ Back ]           [ OK ]          │
+└─────────────────────────────────────────┘
+```
 
 * **Top panel** — every eligible shot on the current bag, the line the model
   solved, a dashed guide at your target time, and a labelled dashed vertical
@@ -364,8 +412,6 @@ on a new bag still runs the normal First-shot rung, which replaces the
 estimate with a real per-bag number.
 
 ## Settings
-
-![The settings page](images/settings-page.jpg)
 
 Defaults live in `plugin.tcl` under `::plugins::GrindAdvisor::settings`:
 
