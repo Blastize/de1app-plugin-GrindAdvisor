@@ -15,6 +15,14 @@ Version 3.16.3 · a plugin for the Decent DE1app · by Blastize
 
 **Settings.** Target shot time, your grinder's range, the popup theme and whether it opens by itself. History and Bag Stats are one tap away; Advanced holds the tools.
 
+![Bag Stats: every bag with its ideal grind, slope, drift and how many shots it took to land on target](docs/bag_stats.png)
+
+**Bag Stats.** Every bag you have pulled: the grind it settled on, how strongly grind moves shot time, how it drifted as it aged, and how many shots it took to hit the target.
+
+![Recent Shot History: each shot's grind change, time and bag shot number](docs/history.png)
+
+**History.** Shot by shot: what you dialled, what it recommended, how long the shot ran.
+
 ## Install
 
 Copy the folder to `de1plus/plugins/GrindAdvisor/`, restart the app, enable **Grind Advisor** under Extensions. Needs the SDB plugin (ships with the app). Works with any skin; Lumen adds the glass look.
