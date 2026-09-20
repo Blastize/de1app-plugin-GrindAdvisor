@@ -4,6 +4,98 @@ Entries follow the CLAUDE.md doc cap (about 15 lines each; entries that added or
 capability keep their full write-path description). The long pre-trim entries survive in the
 Desktop archive snapshot of each version ("GrindAdvisor Archive/GrindAdvisor vX.Y.Z").
 
+## v3.16.3 (popup timer vs Visualizer upload race) - 2026-09-17
+
+Base: v3.16.2.
+
+- With visualizer_upload enabled, SDB inserts a shot on the LEAVE of
+  `::plugins::visualizer_upload::uploadShotData` (SDB.tcl:107-109), not in its own listener. The
+  upload is a synchronous http::geturl that keeps the event loop running, so a slow or failing
+  upload (retries, up to ~27 s) outlasted after_flow_complete (+5 s) plus popup_delay_ms; `run`
+  read the previous id, returned without marking, and the espresso popup surfaced after the NEXT
+  flow event (flush / steam / rinse). Found by the 2026-09-17 review.
+- New `_install_upload_trace` (own `upload_traced` guard, called beside `_install_nav_watch`) adds
+  a leave trace on that proc; `_upload_trace` calls `_schedule_run any`. The handler only schedules
+  an `after`, so SDB's synchronous insert is always done before the timer fires. No upload proc =>
+  no trace, no error. The after_flow_complete path is unchanged (covers the no-Visualizer install).
+- Offline: 4 procs byte-compiled, trace install/idempotence/fire/no-proc asserted in tclsh.
+
+**Safety status: read-only, unchanged. No write behavior exists in this version beyond the
+v3.9.0 Recalculate button (SDB's own resync). Hook registration only.**
+
+Files: GrindAdvisor.tcl, plugin.tcl, docs.
+
+## v3.16.2 (History back to opaque - owner preference) - 2026-09-03 - TABLET-VERIFIED 2026-09-03 (dark theme: History renders the flat v3.15.x page again, popup->History->Done clean, no glass/fallback/error lines)
+
+Base: v3.16.1.
+
+- Review + DevBridge re-verification 2026-09-17: all 7 fpdialog pages pass (text, overlap, bounds),
+  hook/start lines present, no Tcl errors; README version header corrected from v3.15.0 to v3.16.2.
+  No code change, no version bump. Read-only status unchanged.
+- Owner verdict on the v3.16.0 glass History: "doesn't have to be glass" - reverted.
+  `_render_history_dialog` is the opaque v3.15.x draw again (popup_theme scrim + flat cards);
+  the `_glass_dim` / `_glass_panel` helpers and the dim loading are removed (History was their
+  only consumer; they live on in the v3.16.1 archive if ever wanted back).
+- The popup, Curve and Why? keep their glass; the v3.16.1 draw-before-place flash fix stands.
+- Offline: 175 procs byte-compiled; asserted History references no glass, Why?/Curve/popup
+  still do, and the flash-fix ordering is intact.
+
+**Safety status: read-only, unchanged. Presentation only.**
+
+Files: GrindAdvisor.tcl, plugin.tcl, docs.
+
+## v3.16.1 (glass draws before the canvas is placed - kills the black flash) - 2026-09-03 - TABLET-VERIFIED 2026-09-03 (dark theme: Why? glass card, History glass over dim art incl. Next re-render and Done, Curve->Back regression clean, no fallback or error lines; flash gone by construction, owner to confirm by eye)
+
+Base: v3.16.0 (below; never shipped alone).
+
+- Owner report on v3.15.0: Curve -> Back flashed a glitchy black square slightly larger than
+  the popup for a frame. That square is the overlay canvas: placed at card+ring size while its
+  background was still the bare scrim (black in the dark material), before the art was drawn.
+- `_glass_present` now draws the ring, card and border FIRST and places the canvas LAST; the
+  popup/Curve/Why? dialogs leave the canvas unplaced in glass mode until then (opaque keeps the
+  immediate full-screen place); History places only after its dim base layer exists.
+- Offline: 177 procs byte-compiled; ordering asserted (place after border / after dim) in all
+  four overlays.
+
+**Safety status: read-only, unchanged. Draw-order only.**
+
+Files: GrindAdvisor.tcl, plugin.tcl, docs.
+
+## v3.16.0 (Why? and History go glass - every overlay now) - 2026-09-03 - shipped inside v3.16.1
+
+Base: v3.15.0.
+
+- Why? card: the exact popup/Curve path (`_glass_setup`, draw-scoped `_colors_override`,
+  shared `_present_card`; opaque v3.13.x card on any failure).
+- History keeps its full-screen page layout, so its glass is different: the skin's baked DIM
+  art (the modal scrim, unconsumed until now - new lazy `_glass_dim` loader, strict size check)
+  as the base layer, each shot card cut from the slab by new `_glass_panel` (corner rounding
+  and double-radius border copied verbatim from `_glass_present`); per-card and whole-draw
+  opaque fallbacks.
+- All four overlays (popup, Curve, Why?, History) now glass; opaque fallbacks follow popup_theme.
+- Offline: 177 procs byte-compiled clean; body assertions for both dialogs' glass wiring.
+
+**Safety status: read-only, unchanged. Presentation only.**
+
+Files: GrindAdvisor.tcl, plugin.tcl, docs.
+
+## v3.15.0 (the Calibration Curve goes glass) - 2026-09-03 - TABLET-VERIFIED 2026-09-03 (dark theme, Lumen 0.41.0: tile->Curve->OK and popup->Curve->Back->OK, glass both times, no fallback or errors in the log)
+
+Base: v3.14.5.
+
+- `_show_curve_dialog` now runs the exact glass-or-opaque path the after-shot popup proved in
+  v3.14.x: `_glass_setup`, the draw-scoped `_colors_override` (so `_obutton` and the plot wear
+  the material's palette), and the shared `_present_card` call site (card + 24px art ring,
+  Tk grab, opaque v3.13.x card on ANY glass failure). No new mechanism, no layout change.
+- Why?/History overlays intentionally stay opaque; comments updated to say so.
+- Offline harness: sourced + all 175 procs byte-compiled clean; curve body asserted to use
+  `_glass_setup`/`_present_card` and to have dropped its own `_opoly` panel.
+
+**Safety status: read-only, unchanged. Presentation only; no write behavior exists beyond the
+v3.9.0 button-gated SDB resync.**
+
+Files: GrindAdvisor.tcl, plugin.tcl, docs.
+
 ## v3.14.5 (the glass draw's palette reaches the buttons too) - 2026-09-01 - TABLET-VERIFIED 2026-09-01 (closes the glass-popup feature: both themes, grab modality, live page around the card, seam-free ring)
 
 Base: v3.14.4.

@@ -749,9 +749,42 @@ namespace eval ::plugins::GrindAdvisor {
     #  Event wiring
     # ==================================================================
 
+    # v3.16.3: when visualizer_upload is enabled, SDB does not insert the shot
+    # in its own after_flow_complete listener; it inserts on the LEAVE of the
+    # upload proc (SDB.tcl: trace add execution
+    # ::plugins::visualizer_upload::uploadShotData leave ...). The upload is a
+    # synchronous http::geturl that services the event loop, so a slow or
+    # failing upload (retries, up to ~27 s) outlasts after_flow_complete (+5 s)
+    # plus popup_delay_ms: run then saw the PREVIOUS id, returned without
+    # marking, and the espresso popup surfaced after the next flush / steam /
+    # rinse event. Hooking the same leave re-schedules run once the row exists.
+    # The handler only schedules an `after`, so it never depends on the order
+    # of the two leave traces: SDB's synchronous insert is done before the
+    # timer can fire.
+    proc _install_upload_trace {} {
+        variable upload_traced
+        if {$upload_traced} { return 1 }
+        set p ::plugins::visualizer_upload::uploadShotData
+        if {![llength [info procs $p]]} { return 0 }
+        if {[catch { trace add execution $p leave ::plugins::GrindAdvisor::_upload_trace } err]} {
+            msg -ERROR "GrindAdvisor: could not trace $p: $err"
+            return 0
+        }
+        set upload_traced 1
+        msg "GrindAdvisor: also hooked via leave trace on $p"
+        return 1
+    }
+
+    proc _upload_trace {args} {
+        # "any": the popup still needs a NEW valid espresso id, exactly like the
+        # event path; no new error-popup behaviour is introduced.
+        _schedule_run any
+    }
+
     proc register_shot_complete_hook {} {
         variable hooked
         _install_nav_watch
+        _install_upload_trace
         if {$hooked} { return }
         set done 0
 
@@ -3096,8 +3129,9 @@ namespace eval ::plugins::GrindAdvisor {
     #
     #  Text colors follow the MATERIAL's theme via the _colors override
     #  (light text on the dark slab); the Popup theme setting keeps
-    #  governing the opaque popup and the Why?/Curve/History overlays,
-    #  which stay opaque (and full-screen) in this pass.
+    #  governing every opaque fallback. v3.15.0 put the Curve overlay on
+    #  this same glass-or-opaque path, v3.16.0 added Why?; History is
+    #  deliberately opaque (owner decision, v3.16.2).
     # ==================================================================
     variable _glass_mat {}
     variable _glass_slab_src ""
@@ -3198,6 +3232,10 @@ namespace eval ::plugins::GrindAdvisor {
         return 1
     }
 
+    # (v3.16.0 briefly loaded the material's DIM art and cut slab panels
+    # for a glass History; v3.16.2 removed both -- the owner keeps that
+    # full-page list opaque. See the archive snapshot if it returns.)
+
     # Present the glass card inside a seam-free ART RING (v3.14.4).
     #
     #  Every earlier attempt to color the overlay's boundary -- one
@@ -3234,14 +3272,13 @@ namespace eval ::plugins::GrindAdvisor {
         set ow [expr {$cw + 2 * $M}]
         set oh [expr {$ch + 2 * $M}]
 
-        # place MERGES options across calls (v3.14.2, seen on-tablet): the
-        # overlay was first placed -relwidth 1 -relheight 1, and Tk SUMS
-        # -width with -relwidth*parent, so re-placing without a forget left
-        # a card-positioned canvas the size of the whole screen PLUS the
-        # card -- it blacked out everything right and below the card.
-        # Forget first: the new placement then carries only these options.
-        place forget $o
-        place $o -in $parent -x $ox -y $oy -width $ow -height $oh
+        # v3.16.1 flash fix (owner report: Curve -> Back flashed a glitchy
+        # black square slightly larger than the card for a frame): that
+        # square was THIS canvas, placed at card+ring size while its
+        # background was still the bare scrim, before the art below got
+        # drawn. So now everything is drawn FIRST and the canvas is
+        # placed LAST -- a leaked frame can only ever show finished art.
+        # The glass dialogs leave the canvas unplaced until here.
 
         # Base layer: the page's own art at these exact coordinates.
         set ring [image create photo]
@@ -3266,6 +3303,18 @@ namespace eval ::plugins::GrindAdvisor {
         }
         $o create image $M $M -anchor nw -image $card -tags gad
         _opoly $o $M $M [expr {$M + $cw}] [expr {$M + $ch}] [expr {$radius * 2}] "" [dict get $col border] gad
+
+        # place MERGES options across calls (v3.14.2, seen on-tablet): the
+        # overlay was first placed -relwidth 1 -relheight 1, and Tk SUMS
+        # -width with -relwidth*parent, so re-placing without a forget left
+        # a card-positioned canvas the size of the whole screen PLUS the
+        # card -- it blacked out everything right and below the card.
+        # Forget first: the new placement then carries only these options.
+        # (A glass dialog's canvas is normally still unplaced here and the
+        # forget is a no-op; the merge trap bites on the opaque-fallback
+        # re-place, which keeps its own forget.)
+        place forget $o
+        place $o -in $parent -x $ox -y $oy -width $ow -height $oh
         _glass_grab $o
         return [list $M $M]
     }
@@ -3329,9 +3378,15 @@ namespace eval ::plugins::GrindAdvisor {
             # Neutral theme scrim; the card floats centered on it. With
             # glass, _present_card re-places this canvas over just the
             # card's rect, so the live page stays visible around it.
+            # v3.16.1: in glass mode the canvas stays UNPLACED until
+            # _glass_present has drawn its art -- placing it here leaked
+            # one frame of bare black scrim (the glitchy square the owner
+            # saw on Curve -> Back). Opaque keeps the immediate place.
             canvas $o -bg [dict get $col scrim] -highlightthickness 0 -bd 0 \
                 -takefocus 0
-            place $o -in $parent -x 0 -y 0 -relwidth 1 -relheight 1
+            if {!$glass} {
+                place $o -in $parent -x 0 -y 0 -relwidth 1 -relheight 1
+            }
             raise $o
 
             # Card: ~65% width, content-driven height, never edge-to-edge.
@@ -3520,8 +3575,9 @@ namespace eval ::plugins::GrindAdvisor {
             catch { msg "GrindAdvisor: overlay dialog failed: $err" }
             set ok 0
         }
-        # The material palette is scoped to THIS draw; the sub-dialogs
-        # (Why?/Curve/History) keep following popup_theme.
+        # The material palette is scoped to THIS draw; the Curve and
+        # Why? sub-dialogs run their own glass draws with their own
+        # overrides, and History stays on popup_theme (opaque, v3.16.2).
         set _colors_override ""
         return $ok
     }
@@ -3746,9 +3802,18 @@ namespace eval ::plugins::GrindAdvisor {
     }
 
     proc _show_curve_dialog {rec} {
+        variable _glass_mat
+        variable _colors_override
         lassign [_pgeom] parent W H o
         if {[catch {
             catch { destroy $o }
+            # v3.15.0: same glass-or-opaque presentation as the after-shot
+            # popup (v3.14.x): glass when the skin offers the material, and
+            # the whole draw then follows the MATERIAL's theme through the
+            # draw-scoped override so _obutton and the plot agree (v3.14.5
+            # rule). Any glass failure falls back to the opaque card.
+            set glass [_glass_setup $W $H]
+            set _colors_override [expr {$glass ? [dict get $_glass_mat theme] : ""}]
             set col [_colors]
             set F [_pfonts $H]
             set fsec  [dict get $F section]
@@ -3758,7 +3823,10 @@ namespace eval ::plugins::GrindAdvisor {
 
             canvas $o -bg [dict get $col scrim] -highlightthickness 0 -bd 0 \
                 -takefocus 0
-            place $o -in $parent -x 0 -y 0 -relwidth 1 -relheight 1
+            # v3.16.1: unplaced until the glass art is drawn (flash fix).
+            if {!$glass} {
+                place $o -in $parent -x 0 -y 0 -relwidth 1 -relheight 1
+            }
             raise $o
 
             # Wider than the other cards: a plot needs the horizontal room.
@@ -3814,7 +3882,8 @@ namespace eval ::plugins::GrindAdvisor {
             set y1 [expr {$y0 + $ch}]
             set cx [expr {int(($x0 + $x1) / 2)}]
 
-            _opoly $o $x0 $y0 $x1 $y1 $radius [dict get $col panel] [dict get $col border] gad
+            lassign [_present_card $o $parent glass $x0 $y0 $x1 $y1 $radius $col] \
+                x0 y0 x1 y1 cx
 
             set y [expr {$y0 + $pad}]
             _otext $o $cx [expr {$y + $fsec / 2}] center "Calibration Curve" $fsec [dict get $col text] $inner center bold
@@ -3854,8 +3923,11 @@ namespace eval ::plugins::GrindAdvisor {
         } err]} {
             catch { destroy $o }
             catch { msg "GrindAdvisor: curve dialog failed: $err" }
+            set _colors_override ""
             return 0
         }
+        # Draw-scoped, exactly like _show_overlay_dialog (v3.14.5).
+        set _colors_override ""
         return 1
     }
 
@@ -4065,9 +4137,17 @@ namespace eval ::plugins::GrindAdvisor {
     }
 
     proc _show_why_dialog {rec} {
+        variable _glass_mat
+        variable _colors_override
         lassign [_pgeom] parent W H o
         if {[catch {
             catch { destroy $o }
+            # v3.16.0: same glass-or-opaque presentation as the popup
+            # (v3.14.x) and the Curve (v3.15.0): the material's theme via
+            # the draw-scoped override, the shared _present_card call
+            # site, the opaque v3.13.x card on any glass failure.
+            set glass [_glass_setup $W $H]
+            set _colors_override [expr {$glass ? [dict get $_glass_mat theme] : ""}]
             set col [_colors]
             set F [_pfonts $H]
             set fsec  [dict get $F section]
@@ -4077,7 +4157,10 @@ namespace eval ::plugins::GrindAdvisor {
 
             canvas $o -bg [dict get $col scrim] -highlightthickness 0 -bd 0 \
                 -takefocus 0
-            place $o -in $parent -x 0 -y 0 -relwidth 1 -relheight 1
+            # v3.16.1: unplaced until the glass art is drawn (flash fix).
+            if {!$glass} {
+                place $o -in $parent -x 0 -y 0 -relwidth 1 -relheight 1
+            }
             raise $o
 
             set cw [expr {int($W * 0.70)}]
@@ -4137,7 +4220,8 @@ namespace eval ::plugins::GrindAdvisor {
             set y1 [expr {$y0 + $ch}]
             set cx [expr {int(($x0 + $x1) / 2)}]
 
-            _opoly $o $x0 $y0 $x1 $y1 $radius [dict get $col panel] [dict get $col border] gad
+            lassign [_present_card $o $parent glass $x0 $y0 $x1 $y1 $radius $col] \
+                x0 y0 x1 y1 cx
 
             set y [expr {$y0 + $pad}]
             _otext $o $cx [expr {$y + $fsec / 2}] center "Why this recommendation" $fsec [dict get $col text] $inner center bold
@@ -4175,8 +4259,11 @@ namespace eval ::plugins::GrindAdvisor {
         } err]} {
             catch { destroy $o }
             catch { msg "GrindAdvisor: why dialog failed: $err" }
+            set _colors_override ""
             return 0
         }
+        # Draw-scoped, exactly like _show_overlay_dialog (v3.14.5).
+        set _colors_override ""
         return 1
     }
 
@@ -4244,8 +4331,9 @@ namespace eval ::plugins::GrindAdvisor {
     # light theme). _show_overlay_dialog sets _colors_override for the
     # duration of a glass draw and clears it before returning (and
     # _close_dialog clears it again, belt and braces), so every helper
-    # in that draw agrees on the material's palette while the
-    # Why?/Curve/History overlays keep following popup_theme.
+    # in that draw agrees on the material's palette. The popup, Curve
+    # and Why? glass this way; History and every opaque fallback keep
+    # following popup_theme (v3.16.2).
     variable _colors_override ""
 
     proc _colors {{override ""}} {
@@ -4429,6 +4517,10 @@ namespace eval ::plugins::GrindAdvisor {
         lassign [_pgeom] parent W H o
         if {[catch {
             catch { destroy $o }
+            # v3.16.2: History is deliberately OPAQUE (owner decision,
+            # 2026-09-03, reverting v3.16.0's glass here): the card
+            # dialogs keep their material glass, but this full-page list
+            # stays on the flat popup_theme scrim.
             set col [_colors]
             set F [_pfonts $H]
             set fsec  [dict get $F section]

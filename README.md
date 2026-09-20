@@ -1,11 +1,20 @@
-# Grind Advisor v3.14.5
+# Grind Advisor v3.16.3
 
-Current plugin version: **v3.14.5** — on skins that provide a glass
-material (Lumen 0.39.0+), the after-shot popup renders as an iOS-style
-frosted card floating over the live home screen (the page stays visible
-around it; a grab keeps the popup modal). On every other skin — or
-whenever the material is unavailable — the popup is exactly the
-full-screen opaque card it always was. Previous (v3.13.1): loading a cleaning / flush / rinse
+Current plugin version: **v3.16.3** — with the Visualizer upload plugin
+enabled, SDB only stores a shot once the upload has finished, and a slow or
+failing upload could outlast the popup timer; the espresso popup then showed
+up after the next flush. The plugin now also listens to the end of that
+upload, so the popup follows the shot (a little later while the upload
+retries), never a rinse. Previous (v3.16.2): the popup, Calibration Curve and Why?
+card share the glass material and draw before they are placed (no black
+flash); History is the flat opaque page again by owner preference.
+Previous (v3.15.0): the Calibration Curve now renders
+on the same glass material as the popup. Previous (v3.14.5): on skins
+that provide a glass material (Lumen 0.39.0+), the after-shot popup
+renders as an iOS-style frosted card floating over the live home screen
+(the page stays visible around it; a grab keeps the popup modal). On
+every other skin — or whenever the material is unavailable — the popup
+and curve are exactly the full-screen opaque cards they always were. Previous (v3.13.1): loading a cleaning / flush / rinse
 profile no longer blanks the recommendation: a non-espresso profile is not
 a bag identity, so the saved number stays on screen until you switch back
 to a real espresso profile. (v3.13.0): a freshly scanned bag with no shots
