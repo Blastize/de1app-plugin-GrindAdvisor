@@ -1,4 +1,32 @@
-# Grind Advisor v3.16.3
+# Grind Advisor
+
+**Your next grind setting, after every espresso. Read-only, nothing to type.**
+Version 3.16.3 · a plugin for the Decent DE1app · by Blastize
+
+![After the shot: the recommended next grind on a glass card over the Lumen home screen](docs/popup_glass.png)
+
+**The after-shot popup.** Shot saved, here is your next grind, and why. On Lumen it floats on glass over the live home screen; on any other skin it is the same card, opaque.
+
+![The Calibration Curve: this bag's shots, the fitted line and the target time](docs/calibration_curve.png)
+
+**Calibration Curve.** Every shot of the current bag, the line the plugin fitted through them, and where your target time lands on it. Residuals underneath tell you when something other than grind is driving the shot.
+
+![The settings page: target shot time, grinder range, popup options, History and Bag Stats](docs/settings.png)
+
+**Settings.** Target shot time, your grinder's range, the popup theme and whether it opens by itself. History and Bag Stats are one tap away; Advanced holds the tools.
+
+## Install
+
+Copy the folder to `de1plus/plugins/GrindAdvisor/`, restart the app, enable **Grind Advisor** under Extensions. Needs the SDB plugin (ships with the app). Works with any skin; Lumen adds the glass look.
+
+## Safety
+
+Reads your shots from SDB and never writes to it. History files are never touched. The one button that causes a write, Advanced > Recalculate from History, asks SDB to resync its own database.
+
+<details>
+<summary><b>Full reference and version notes</b></summary>
+
+## Reference
 
 Current plugin version: **v3.16.3** — with the Visualizer upload plugin
 enabled, SDB only stores a shot once the upload has finished, and a slow or
@@ -720,3 +748,5 @@ semantics, or SDB write behavior (still read-only / SELECT-only):
   backward through the filtered, valid-espresso-only shot list, so it always
   skips rinse/flush/steam rows instead of grabbing the newest SDB row
   regardless of type.
+
+</details>
